@@ -11,6 +11,7 @@ import os
 from dataclasses import dataclass
 import logging
 import argparse
+import re
 
 logging.getLogger('selenium').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
@@ -28,11 +29,11 @@ BASE_URL = "https://www.chipdip.ru"
 @dataclass
 class ElectronicComponent:
     name: str
-    tu_number: str
-    manufacturer: str
+    tu_number: str  # Номенклатурный номер ChipDip
+    manufacturer: str  # Бренд (производитель)
     supplier: str
     source: str = "chipdip.ru"
-    article: str = ""
+    article: str = ""  # Артикул из URL
     url: str = ""
     category: str = ""
 
@@ -57,8 +58,8 @@ class ChipDipScraper:
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--log-level=3")
-        options.add_argument("--disable-logging")  # Отключаем логирование
-        options.add_experimental_option('excludeSwitches', ['enable-logging'])  # Отключаем логи Chrome
+        options.add_argument("--disable-logging")
+        options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
         user_agents = [
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -94,6 +95,50 @@ class ChipDipScraper:
         driver.get(url)
         self.random_sleep(3, 5)
 
+    def get_category_from_user(self):
+        """Запрашивает у пользователя URL категории"""
+        print("\n=== ВВОД URL КАТЕГОРИИ ===")
+        while True:
+            url = input("Введите URL категории ChipDip: ").strip()
+            if url.startswith(BASE_URL) and '/catalog/' in url:
+                # Извлекаем название категории из URL
+                category_name = self.extract_category_name_from_url(url)
+                return url, category_name
+            else:
+                print(f"URL должен начинаться с {BASE_URL} и содержать '/catalog/'")
+
+    def extract_category_name_from_url(self, url):
+        """Извлекает название категории из URL"""
+        try:
+            # Пытаемся извлечь название из URL
+            match = re.search(r'/catalog/([^/?]+)', url)
+            if match:
+                name = match.group(1)
+                # Заменяем дефисы на пробелы и делаем первую букву заглавной
+                name = name.replace('-', ' ').title()
+                return name
+        except:
+            pass
+        return "Custom_Category"
+
+    def get_page_range_from_user(self):
+        """Запрашивает у пользователя диапазон страниц для парсинга"""
+        print("\n=== ДИАПАЗОН СТРАНИЦ ===")
+        print("Введите диапазон страниц для парсинга (включительно)")
+
+        while True:
+            try:
+                start_page = int(input("С какой страницы начать парсинг? (1): ") or "1")
+                end_page = int(input("По какую страницу парсить?: "))
+
+                if 1 <= start_page <= end_page:
+                    logger.info(f"Выбран диапазон страниц: {start_page}-{end_page}")
+                    return start_page, end_page
+                else:
+                    print("Ошибка: начальная страница должна быть не меньше 1 и не больше конечной")
+            except ValueError:
+                print("Ошибка: введите целые числа")
+
     def get_product_features(self, driver, url, category):
         try:
             driver.get(url)
@@ -109,6 +154,13 @@ class ChipDipScraper:
             except NoSuchElementException:
                 self.handle_captcha(driver, url)
                 return self.get_product_features(driver, url, category)
+
+            # Извлекаем номенклатурный номер (ТУ)
+            tu_number = self.extract_tu_number(driver)
+
+            # Извлекаем бренд (производителя)
+            manufacturer = self.extract_brand(driver)
+            logger.info(f"Manufacturer extracted: {manufacturer}")
 
             try:
                 button = driver.find_element(By.CSS_SELECTOR,
@@ -127,14 +179,15 @@ class ChipDipScraper:
                 param_value = value.text.strip()
                 params[param_name] = param_value
 
+            # Оставляем артикул из URL как было
             article = self.extract_article_from_url(url)
 
             component = ElectronicComponent(
                 name=product_name,
-                tu_number=params.get('ту', ''),
-                manufacturer=params.get('производитель', ''),
+                tu_number=tu_number,  # Номенклатурный номер ChipDip
+                manufacturer=manufacturer,  # Бренд (производитель)
                 supplier=params.get('поставщик', 'Чип и Дип'),
-                article=article,
+                article=article,  # Артикул из URL
                 url=url,
                 category=category
             )
@@ -145,7 +198,208 @@ class ChipDipScraper:
             logger.error(f"Error parsing product {url}: {e}")
             return None
 
+    def extract_tu_number(self, driver):
+        """Извлекает номенклатурный номер (ТУ) со страницы товара"""
+        try:
+            # Ищем элемент с номенклатурным номером
+            selectors = [
+                "div.product__code",
+                "span.product__code",
+                ".product__code",
+                "div[class*='code']",
+                "span[class*='code']"
+            ]
+
+            for selector in selectors:
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    for element in elements:
+                        text = element.text.strip()
+                        if text and any(word in text.lower() for word in ['номенкл', 'номер', 'код']):
+                            # Извлекаем только цифры из текста
+                            numbers = re.findall(r'\d+', text)
+                            if numbers:
+                                return numbers[0]
+                except:
+                    continue
+
+            # Альтернативный метод: ищем по структуре страницы
+            try:
+                # Ищем рядом с текстом "Номенклатурный номер"
+                xpath_selectors = [
+                    "//*[contains(text(), 'Номенклатурный номер')]/following-sibling::*",
+                    "//*[contains(text(), 'Номенклатурный номер')]/../*[last()]",
+                    "//div[contains(@class, 'product__info')]//*[contains(text(), '900')]"
+                ]
+
+                for xpath in xpath_selectors:
+                    try:
+                        elements = driver.find_elements(By.XPATH, xpath)
+                        for element in elements:
+                            text = element.text.strip()
+                            numbers = re.findall(r'\d+', text)
+                            if numbers and len(numbers[0]) >= 6:  # Номера обычно длинные
+                                return numbers[0]
+                    except:
+                        continue
+            except:
+                pass
+
+        except Exception as e:
+            logger.warning(f"Could not extract TU number: {e}")
+
+        return ""
+
+    def extract_brand(self, driver):
+        """Извлекает бренд (производителя) агрессивными методами"""
+        try:
+            # Метод 1: Поиск по itemprop="brand" (самый надежный)
+            try:
+                brand_elements = driver.find_elements(By.CSS_SELECTOR, '[itemprop="brand"]')
+                for element in brand_elements:
+                    text = element.text.strip()
+                    if text and len(text) > 1:
+                        logger.info(f"Found brand via itemprop: {text}")
+                        return text
+            except Exception as e:
+                logger.debug(f"Method 1 failed: {e}")
+
+            # Метод 2: Поиск ссылок на производителя
+            try:
+                brand_links = driver.find_elements(By.CSS_SELECTOR, 'a[href*="/manufacturer/"]')
+                for link in brand_links:
+                    text = link.text.strip()
+                    if text and len(text) > 1:
+                        logger.info(f"Found brand via manufacturer link: {text}")
+                        return text
+            except Exception as e:
+                logger.debug(f"Method 2 failed: {e}")
+
+            # Метод 3: Поиск в таблице характеристик
+            try:
+                # Получаем все строки таблицы
+                rows = driver.find_elements(By.CSS_SELECTOR, ".product__param-row")
+                for row in rows:
+                    try:
+                        name_elem = row.find_element(By.CSS_SELECTOR, ".product__param-name")
+                        value_elem = row.find_element(By.CSS_SELECTOR, ".product__param-value")
+                        if name_elem and value_elem:
+                            name_text = name_elem.text.strip().lower()
+                            value_text = value_elem.text.strip()
+                            if 'бренд' in name_text and value_text:
+                                logger.info(f"Found brand via param table: {value_text}")
+                                return value_text
+                    except:
+                        continue
+            except Exception as e:
+                logger.debug(f"Method 3 failed: {e}")
+
+            # Метод 4: Поиск по классам, связанным с брендом
+            brand_selectors = [
+                ".product__brand",
+                ".brand",
+                ".manufacturer",
+                ".vendor",
+                ".producer",
+                ".firm",
+                ".maker"
+            ]
+
+            for selector in brand_selectors:
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    for element in elements:
+                        text = element.text.strip()
+                        if text and len(text) > 1:
+                            logger.info(f"Found brand via class {selector}: {text}")
+                            return text
+                except:
+                    continue
+
+            # Метод 5: Поиск в заголовке или основном контенте
+            try:
+                # Иногда бренд указан в заголовке страницы или рядом с названием товара
+                title_selectors = [
+                    "h1",
+                    ".product__title",
+                    ".product-name",
+                    ".product__header",
+                    ".product__info",
+                    ".product-details"
+                ]
+
+                for selector in title_selectors:
+                    try:
+                        element = driver.find_element(By.CSS_SELECTOR, selector)
+                        text = element.text
+                        # Ищем известные бренды в тексте
+                        known_brands = [
+                            "Analog Devices", "Texas Instruments", "STMicroelectronics",
+                            "Infineon", "NXP", "ON Semiconductor", "Microchip", "Maxim",
+                            "ADI", "TI", "ST", "Infineon", "NXP", "ON Semi", "Microchip",
+                            "Maxim Integrated", "Renesas", "Vishay", "ROHM", "Fairchild",
+                            "Intersil", "Linear Technology", "Altera", "Xilinx", "Intel",
+                            "AMD", "Qualcomm", "Broadcom", "Cypress", "Silicon Labs"
+                        ]
+                        for brand in known_brands:
+                            if brand.lower() in text.lower():
+                                logger.info(f"Found known brand in text: {brand}")
+                                return brand
+                    except:
+                        continue
+            except Exception as e:
+                logger.debug(f"Method 5 failed: {e}")
+
+            # Метод 6: Поиск по XPath с текстом "Бренд"
+            try:
+                xpaths = [
+                    "//td[contains(text(), 'Бренд')]/following-sibling::td",
+                    "//th[contains(text(), 'Бренд')]/following-sibling::td",
+                    "//div[contains(text(), 'Бренд')]/following-sibling::div",
+                    "//span[contains(text(), 'Бренд')]/following-sibling::span"
+                ]
+
+                for xpath in xpaths:
+                    try:
+                        elements = driver.find_elements(By.XPATH, xpath)
+                        for element in elements:
+                            text = element.text.strip()
+                            if text:
+                                logger.info(f"Found brand via XPath: {text}")
+                                return text
+                    except:
+                        continue
+            except Exception as e:
+                logger.debug(f"Method 6 failed: {e}")
+
+            # Метод 7: Поиск в любом месте страницы по ключевым словам
+            try:
+                page_text = driver.find_element(By.TAG_NAME, "body").text
+                brand_patterns = [
+                    r"Бренд[\s:\-]*([^\n\r]+)",
+                    r"Производитель[\s:\-]*([^\n\r]+)",
+                    r"Manufacturer[\s:\-]*([^\n\r]+)",
+                    r"Brand[\s:\-]*([^\n\r]+)"
+                ]
+
+                for pattern in brand_patterns:
+                    matches = re.search(pattern, page_text, re.IGNORECASE)
+                    if matches:
+                        brand = matches.group(1).strip()
+                        if brand and len(brand) > 1:
+                            logger.info(f"Found brand via regex: {brand}")
+                            return brand
+            except Exception as e:
+                logger.debug(f"Method 7 failed: {e}")
+
+        except Exception as e:
+            logger.error(f"All brand extraction methods failed: {e}")
+
+        logger.warning("Brand not found")
+        return "Не определен"
+
     def extract_article_from_url(self, url):
+        """Извлекает артикул из URL (как было изначально)"""
         try:
             parts = url.split('/')
             for i, part in enumerate(parts):
@@ -155,20 +409,21 @@ class ChipDipScraper:
             pass
         return ""
 
-    def parse_category_page(self, driver, category_url, category_name, max_pages=None):
-        logger.info(f"Parsing category: {category_name}")
+    def parse_category_page_range(self, driver, category_url, category_name, start_page, end_page):
+        """Парсит указанный диапазон страниц категории"""
+        logger.info(f"Parsing category: {category_name}, pages {start_page}-{end_page}")
 
         category_components = []
-        page_num = 1
-        has_products = True
 
-        while has_products and (max_pages is None or page_num <= max_pages):
+        for page_num in range(start_page, end_page + 1):
             if page_num == 1:
                 page_url = category_url
             else:
                 base_url = category_url.split('?')[0]
-                separator = "?" if "?" not in category_url else "&"
-                page_url = f"{base_url}{separator}page={page_num}"
+                if '?' in category_url:
+                    page_url = f"{category_url}&page={page_num}"
+                else:
+                    page_url = f"{category_url}?page={page_num}"
 
             logger.info(f"Page {page_num} - {page_url}")
 
@@ -182,20 +437,20 @@ class ChipDipScraper:
                         EC.presence_of_element_located((By.CSS_SELECTOR, "tr.with-hover a.link"))
                     )
                 except TimeoutException:
-                    logger.info("No products found - stopping pagination")
+                    logger.info(f"No products found on page {page_num} - stopping")
                     break
 
                 product_elements = driver.find_elements(By.CSS_SELECTOR, "tr.with-hover a.link")
                 product_urls = [el.get_attribute('href') for el in product_elements]
 
                 if not product_urls:
-                    logger.info("No products on page - stopping pagination")
+                    logger.info(f"No products on page {page_num} - stopping")
                     break
 
-                logger.info(f"Found {len(product_urls)} products")
+                logger.info(f"Found {len(product_urls)} products on page {page_num}")
 
                 for i, product_url in enumerate(product_urls):
-                    logger.info(f"Parsing product {i + 1}/{len(product_urls)}")
+                    logger.info(f"Parsing product {i + 1}/{len(product_urls)} on page {page_num}")
                     component = self.get_product_features(driver, product_url, category_name)
                     if component:
                         category_components.append(component)
@@ -203,20 +458,19 @@ class ChipDipScraper:
                     if i < len(product_urls) - 1:
                         self.random_sleep(2, 4)
 
-                page_num += 1
-
-                if page_num <= (max_pages if max_pages else 1000):
+                if page_num < end_page:
                     time.sleep(random.uniform(4, 8))
 
             except Exception as e:
                 logger.error(f"Error processing page {page_num}: {e}")
-                break
+                continue
 
-        logger.info(f"Category completed: {len(category_components)} products from {page_num - 1} pages")
+        logger.info(f"Category completed: {len(category_components)} products from pages {start_page}-{end_page}")
         return category_components
 
     def save_results(self, components, filename):
         if not components:
+            logger.warning("No components to save")
             return
 
         filepath = os.path.join('data', 'results', filename)
@@ -225,11 +479,11 @@ class ChipDipScraper:
         for comp in components:
             data.append({
                 'name': comp.name,
-                'tu_number': comp.tu_number,
-                'manufacturer': comp.manufacturer,
+                'tu_number': comp.tu_number,  # Номенклатурный номер ChipDip
+                'manufacturer': comp.manufacturer,  # Бренд (производитель)
                 'supplier': comp.supplier,
                 'source': comp.source,
-                'article': comp.article,
+                'article': comp.article,  # Артикул из URL
                 'url': comp.url,
                 'category': comp.category
             })
@@ -241,31 +495,37 @@ class ChipDipScraper:
         except Exception as e:
             logger.error(f"Error saving to {filepath}: {e}")
 
-    def run(self, max_pages=None):
+    def run(self):
         logger.info("Starting chipdip scraper")
         start_time = time.time()
 
         driver = self.setup_driver()
 
         try:
-            catalog_url = f"{BASE_URL}/catalog/electronic-components"
-            driver.get(catalog_url)
-            time.sleep(3)
+            # Запрашиваем категорию у пользователя
+            category_url, category_name = self.get_category_from_user()
 
-            category_elements = driver.find_elements(By.CSS_SELECTOR, "li.catalog__item a.link")
-            category_links = [el.get_attribute('href') for el in category_elements]
-            category_names = [el.text for el in category_elements]
+            if not category_url:
+                logger.error("No category selected")
+                return
 
-            if category_links:
-                category_url = category_links[0]
-                category_name = category_names[0]
+            logger.info(f"Selected category: {category_name}")
 
-                logger.info(f"Processing category: {category_name}")
-                components = self.parse_category_page(driver, category_url, category_name, max_pages)
+            # Запрашиваем диапазон страниц у пользователя
+            start_page, end_page = self.get_page_range_from_user()
 
-                safe_category_name = "".join(c for c in category_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
-                safe_category_name = safe_category_name.replace(' ', '_')
-                self.save_results(components, f"category_{safe_category_name}_results.json")
+            if start_page is None or end_page is None:
+                return
+
+            # Парсим выбранный диапазон страниц
+            components = self.parse_category_page_range(driver, category_url, category_name, start_page, end_page)
+
+            # Создаем имя файла с категорией и диапазоном страниц
+            safe_category_name = "".join(c for c in category_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
+            safe_category_name = safe_category_name.replace(' ', '_')
+            filename = f"{safe_category_name}_pages_{start_page}_to_{end_page}.json"
+
+            self.save_results(components, filename)
 
             total_time = time.time() - start_time
             logger.info(f"Scraping completed in {total_time:.1f} seconds")
@@ -276,9 +536,7 @@ class ChipDipScraper:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='ChipDip Scraper')
-    parser.add_argument('--pages', type=int, default=None, help='Max pages to parse per category (default: all pages)')
-
     args = parser.parse_args()
 
     scraper = ChipDipScraper()
-    scraper.run(max_pages=args.pages)
+    scraper.run()
