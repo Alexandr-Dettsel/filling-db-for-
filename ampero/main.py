@@ -8,12 +8,17 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 import time
 import json
 import os
+import zipfile
+import tempfile
 from dataclasses import dataclass
 import logging
 import argparse
 import re
 from twocaptcha import TwoCaptcha
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.getLogger('selenium').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
@@ -26,7 +31,11 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://ampero.ru"
-API_KEY = "---"
+API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "---")
+PROXY_HOST = os.getenv("PROXY_HOST", "")
+PROXY_PORT = os.getenv("PROXY_PORT", "3128")
+PROXY_USER = os.getenv("PROXY_USER", "")
+PROXY_PASS = os.getenv("PROXY_PASS", "")
 
 
 @dataclass
@@ -53,16 +62,88 @@ class AmperoScraper:
         for directory in directories:
             os.makedirs(directory, exist_ok=True)
 
+    def _create_proxy_extension(self, host, port, username, password):
+        """Создает расширение Chrome/Edge для прокси с аутентификацией"""
+        manifest_json = """
+        {
+            "version": "1.0.0",
+            "manifest_version": 2,
+            "name": "Chrome Proxy",
+            "permissions": [
+                "proxy",
+                "tabs",
+                "unlimitedStorage",
+                "storage",
+                "<all_urls>",
+                "webRequest",
+                "webRequestBlocking"
+            ],
+            "background": {
+                "scripts": ["background.js"]
+            },
+            "minimum_chrome_version":"22.0.0"
+        }
+        """
+        
+        background_js = """
+        var config = {
+            mode: "fixed_servers",
+            rules: {
+                singleProxy: {
+                    scheme: "http",
+                    host: "%s",
+                    port: parseInt(%s)
+                },
+                bypassList: ["localhost"]
+            }
+        };
+        
+        chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+        
+        function callbackFn(details) {
+            return {
+                authCredentials: {
+                    username: "%s",
+                    password: "%s"
+                }
+            };
+        }
+        
+        chrome.webRequest.onAuthRequired.addListener(
+            callbackFn,
+            {urls: ["<all_urls>"]},
+            ['blocking']
+        );
+        """ % (host, port, username, password)
+        
+        # Создаем временную директорию для расширения
+        extension_dir = tempfile.mkdtemp()
+        
+        # Создаем файлы расширения
+        with open(os.path.join(extension_dir, "manifest.json"), "w") as f:
+            f.write(manifest_json)
+        
+        with open(os.path.join(extension_dir, "background.js"), "w") as f:
+            f.write(background_js)
+        
+        return extension_dir
+
     def setup_driver(self):
         options = Options()
         options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--disable-extensions")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--log-level=3")
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
+        
+        if PROXY_HOST and PROXY_USER and PROXY_PASS:
+            proxy_extension = self._create_proxy_extension(PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS)
+            options.add_argument(f"--load-extension={proxy_extension}")
+            logger.info(f"Прокси настроен через расширение: {PROXY_HOST}:{PROXY_PORT}")
+        else:
+            logger.warning("Прокси не настроен. Проверьте переменные окружения PROXY_HOST, PROXY_USER, PROXY_PASS")
 
         driver = webdriver.Edge(options=options)
         driver.maximize_window()
