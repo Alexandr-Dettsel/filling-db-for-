@@ -16,6 +16,7 @@ import tempfile
 from dataclasses import dataclass
 import logging
 import re
+import itertools
 from twocaptcha import TwoCaptcha
 from dotenv import load_dotenv
 
@@ -33,10 +34,23 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.chipdip.ru"
 API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "---")
-PROXY_HOST = os.getenv("PROXY_HOST", "")
-PROXY_PORT = os.getenv("PROXY_PORT", "3128")
-PROXY_USER = os.getenv("PROXY_USER", "")
-PROXY_PASS = os.getenv("PROXY_PASS", "")
+
+
+def _parse_proxies():
+    raw = os.getenv("PROXIES", "")
+    proxies = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        if len(parts) == 4:
+            proxies.append({"host": parts[0], "port": parts[1], "user": parts[2], "pass": parts[3]})
+    return proxies
+
+
+PROXY_LIST = _parse_proxies()
+_proxy_cycle = itertools.cycle(PROXY_LIST) if PROXY_LIST else None
 
 
 @dataclass
@@ -57,6 +71,7 @@ class ChipDipScraper:
         self.components = []
         self.create_directories()
         self.solver = TwoCaptcha(API_KEY)
+        self._rotate_every = 1  # менять прокси каждые N страниц категории
 
     def create_directories(self):
         directories = ['data', 'data/results']
@@ -140,12 +155,13 @@ class ChipDipScraper:
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
         
-        if PROXY_HOST and PROXY_USER and PROXY_PASS:
-            proxy_extension = self._create_proxy_extension(PROXY_HOST, PROXY_PORT, PROXY_USER, PROXY_PASS)
+        if PROXY_LIST:
+            p = next(_proxy_cycle)
+            proxy_extension = self._create_proxy_extension(p["host"], p["port"], p["user"], p["pass"])
             options.add_argument(f"--load-extension={proxy_extension}")
-            logger.info(f"Прокси настроен через расширение: {PROXY_HOST}:{PROXY_PORT}")
+            logger.info(f"Прокси: {p['host']}:{p['port']}")
         else:
-            logger.warning("Прокси не настроен. Проверьте переменные окружения PROXY_HOST, PROXY_USER, PROXY_PASS")
+            logger.warning("Прокси не настроены")
 
         driver = webdriver.Edge(options=options)
         driver.maximize_window()
@@ -890,6 +906,15 @@ class ChipDipScraper:
         category_components = []
 
         for page_num in range(start_page, end_page + 1):
+            # Ротация прокси каждые _rotate_every страниц
+            if PROXY_LIST and page_num != start_page and (page_num - start_page) % self._rotate_every == 0:
+                logger.info(f"Ротация прокси (каждые {self._rotate_every} стр.)...")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = self.setup_driver()
+
             if page_num == 1:
                 page_url = self.add_max_items_param(category_url)
             else:
@@ -947,7 +972,7 @@ class ChipDipScraper:
                 continue
 
         logger.info(f"Категория завершена: {len(category_components)} товаров со страниц {start_page}-{end_page}")
-        return category_components
+        return category_components, driver
 
     def save_results(self, components, filename):
         if not components:
@@ -995,7 +1020,7 @@ class ChipDipScraper:
             if start_page is None or end_page is None:
                 return
 
-            components = self.parse_category_page_range(driver, category_url, category_name, start_page, end_page)
+            components, driver = self.parse_category_page_range(driver, category_url, category_name, start_page, end_page)
 
             safe_category_name = "".join(c for c in category_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
             safe_category_name = safe_category_name.replace(' ', '_')

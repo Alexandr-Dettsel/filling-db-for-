@@ -11,6 +11,7 @@ import json
 import os
 import base64
 import struct
+import tempfile
 from dataclasses import dataclass
 import logging
 import re
@@ -33,6 +34,42 @@ BASE_URL = "https://www.chipdip.ru"
 API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "---")
 
 
+def _parse_proxies():
+    raw = os.getenv("PROXIES", "")
+    proxies = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        if len(parts) == 4:
+            proxies.append({"host": parts[0], "port": parts[1], "user": parts[2], "pass": parts[3]})
+    return proxies
+
+
+PROXY_LIST = _parse_proxies()
+_proxy_index = 0  # текущий индекс в PROXY_LIST
+
+
+def _next_proxy():
+    """Возвращает следующий прокси по кругу. None если список пуст."""
+    global _proxy_index
+    if not PROXY_LIST:
+        return None
+    p = PROXY_LIST[_proxy_index % len(PROXY_LIST)]
+    _proxy_index += 1
+    return p
+
+
+def _remove_proxy(proxy):
+    """Удаляет забаненный прокси из списка."""
+    try:
+        PROXY_LIST.remove(proxy)
+        logger.warning(f"Прокси {proxy['host']}:{proxy['port']} удалён из списка. Осталось: {len(PROXY_LIST)}")
+    except ValueError:
+        pass
+
+
 @dataclass
 class ElectronicComponent:
     name: str
@@ -50,6 +87,7 @@ class ChipDipScraper:
         self.components = []
         self.create_directories()
         self.solver = TwoCaptcha(API_KEY)
+        self._rotate_every = 1  # менять прокси каждые N страниц категории
 
     def create_directories(self):
         directories = [
@@ -59,14 +97,31 @@ class ChipDipScraper:
         for directory in directories:
             os.makedirs(directory, exist_ok=True)
 
+    def _create_proxy_extension(self, host, port, username, password):
+        manifest_json = '{"version":"1.0.0","manifest_version":2,"name":"Proxy","permissions":["proxy","tabs","unlimitedStorage","storage","<all_urls>","webRequest","webRequestBlocking"],"background":{"scripts":["background.js"]},"minimum_chrome_version":"22.0.0"}'
+        background_js = """
+        var config = {mode:"fixed_servers",rules:{singleProxy:{scheme:"http",host:"%s",port:parseInt(%s)},bypassList:["localhost"]}};
+        chrome.proxy.settings.set({value:config,scope:"regular"},function(){});
+        function callbackFn(details){return{authCredentials:{username:"%s",password:"%s"}};}
+        chrome.webRequest.onAuthRequired.addListener(callbackFn,{urls:["<all_urls>"]},['blocking']);
+        """ % (host, port, username, password)
+        extension_dir = tempfile.mkdtemp()
+        with open(os.path.join(extension_dir, "manifest.json"), "w") as f:
+            f.write(manifest_json)
+        with open(os.path.join(extension_dir, "background.js"), "w") as f:
+            f.write(background_js)
+        return extension_dir
+
     def setup_driver(self):
         options = Options()
         options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--disable-extensions")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--log-level=3")
         options.add_argument("--disable-logging")
+        options.add_argument("--disable-webrtc")
+        options.add_argument("--webrtc-ip-handling-policy=disable_non_proxied_udp")
+        options.add_argument("--enforce-webrtc-ip-permission-check")
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
         user_agents = [
@@ -78,7 +133,21 @@ class ChipDipScraper:
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
 
+        if PROXY_LIST:
+            p = _next_proxy()
+            if p:
+                self._current_proxy = p
+                ext = self._create_proxy_extension(p["host"], p["port"], p["user"], p["pass"])
+                options.add_argument(f"--load-extension={ext}")
+                logger.info(f"Прокси: {p['host']}:{p['port']} (осталось {len(PROXY_LIST)})")
+            else:
+                self._current_proxy = None
+                logger.warning("Все прокси исчерпаны, работаем без прокси")
+        else:
+            self._current_proxy = None
+
         driver = webdriver.Edge(options=options)
+        driver.set_page_load_timeout(30)
         driver.maximize_window()
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         return driver
@@ -108,6 +177,87 @@ class ChipDipScraper:
             return False
         except:
             return False
+
+    def is_proxy_blocked(self, driver):
+        """Проверяет жёсткий бан прокси. Срабатывает ТОЛЬКО на страницах-заглушках."""
+        try:
+            title = driver.title.lower()
+            # Страница бана chipdip имеет характерный title и очень мало контента
+            if "недоступен" in title or "access denied" in title or "403" in title:
+                return True
+            # Проверяем body только если страница короткая (заглушка)
+            body_text = driver.find_element(By.TAG_NAME, "body").text.strip()
+            if len(body_text) < 500:
+                hard_ban = [
+                    "запретил доступ из вашей сети",
+                    "access denied",
+                    "403 forbidden",
+                ]
+                body_lower = body_text.lower()
+                for sign in hard_ban:
+                    if sign in body_lower:
+                        return True
+            return False
+        except:
+            return False
+
+    def is_browser_check(self, driver):
+        """Проверяет проверку браузера (Cloudflare). Только на страницах-заглушках."""
+        try:
+            title = driver.title.lower()
+            # Cloudflare/DDoS-Guard ставят характерный title
+            if "just a moment" in title or "checking" in title or "ddos" in title:
+                return True
+            # Проверяем body только если страница короткая
+            body_text = driver.find_element(By.TAG_NAME, "body").text.strip()
+            if len(body_text) < 500:
+                check_signs = [
+                    "checking your browser",
+                    "please wait a few seconds",
+                    "ddos-guard",
+                ]
+                body_lower = body_text.lower()
+                for sign in check_signs:
+                    if sign in body_lower:
+                        return True
+            return False
+        except:
+            return False
+
+    def wait_for_browser_check(self, driver, timeout=15):
+        """Ждёт прохождения проверки браузера. True — прошло, False — не прошло."""
+        logger.info("Проверка браузера (Cloudflare), ждём до %d сек...", timeout)
+        for tick in range(timeout):
+            time.sleep(1)
+            if not self.is_browser_check(driver):
+                logger.info("✓ Проверка браузера пройдена за %d сек", tick + 1)
+                return True
+            if tick % 5 == 4:
+                logger.info("  %d/%d сек, всё ещё проверка...", tick + 1, timeout)
+        logger.warning("Проверка браузера не прошла за %d сек", timeout)
+        return False
+
+    def switch_proxy(self, driver):
+        """Удаляет текущий забаненный прокси и создаёт драйвер с новым"""
+        if not PROXY_LIST:
+            logger.error("Список прокси пуст, переключение невозможно")
+            return driver
+
+        # Удаляем забаненный прокси
+        if self._current_proxy:
+            _remove_proxy(self._current_proxy)
+
+        if not PROXY_LIST:
+            logger.error("Все прокси забанены!")
+            return driver
+
+        logger.warning("Переключаемся на следующий прокси...")
+        try:
+            driver.quit()
+        except Exception:
+            pass
+        time.sleep(2)
+        return self.setup_driver()
 
     def get_captcha_type(self, driver):
         """Определяет тип капчи по наличию iframe"""
@@ -477,7 +627,22 @@ class ChipDipScraper:
 
     def get_product_features(self, driver, url, category):
         try:
-            driver.get(url)
+            try:
+                self.random_sleep(1, 3)
+                driver.get(url)
+            except TimeoutException:
+                logger.warning(f"Товар не загрузился за 30 сек — скип: {url}")
+                return None
+            time.sleep(1)
+
+            # Проверка браузера — ждём
+            if self.is_browser_check(driver):
+                self.wait_for_browser_check(driver, timeout=15)
+
+            # Если прокси забанен — не пробуем дальше
+            if self.is_proxy_blocked(driver):
+                logger.warning(f"Прокси забанен при загрузке товара {url}")
+                return None
 
             # Сразу проверяем капчу (chipdip редиректит на /forms/captcha2)
             if self.is_captcha_page(driver):
@@ -485,7 +650,11 @@ class ChipDipScraper:
                 self.handle_captcha(driver, url)
                 # После решения капчи повторно загружаем нужную страницу
                 if 'captcha' in driver.current_url.lower():
-                    driver.get(url)
+                    try:
+                        driver.get(url)
+                    except TimeoutException:
+                        logger.warning(f"Товар не загрузился за 30 сек после капчи — скип: {url}")
+                        return None
                     time.sleep(2)
 
             if random.random() > 0.3:
@@ -511,6 +680,7 @@ class ChipDipScraper:
                 button = driver.find_element(By.CSS_SELECTOR,
                                              'span.link.link_pseudo.link_showhide.f-size.with-icon.with-icon_right.with-icon_sort-down')
                 driver.execute_script("arguments[0].click();", button)
+                time.sleep(random.uniform(1, 2))
             except NoSuchElementException:
                 pass
 
@@ -760,6 +930,15 @@ class ChipDipScraper:
         category_components = []
 
         for page_num in range(start_page, end_page + 1):
+            # Ротация прокси каждые _rotate_every страниц
+            if PROXY_LIST and page_num != start_page and (page_num - start_page) % self._rotate_every == 0:
+                logger.info(f"Ротация прокси (каждые {self._rotate_every} стр.)...")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = self.setup_driver()
+
             if page_num == 1:
                 page_url = category_url
             else:
@@ -772,14 +951,50 @@ class ChipDipScraper:
             logger.info(f"Page {page_num} - {page_url}")
 
             try:
-                driver.get(page_url)
+                try:
+                    driver.get(page_url)
+                except TimeoutException:
+                    logger.warning(f"Страница {page_num} не загрузилась за 30 сек — скип")
+                    continue
+                time.sleep(2)
+
+                # Проверка браузера (Cloudflare) — ждём, если не прошло — меняем прокси
+                if self.is_browser_check(driver):
+                    if not self.wait_for_browser_check(driver, timeout=15):
+                        if PROXY_LIST:
+                            driver = self.switch_proxy(driver)
+                            try:
+                                driver.get(page_url)
+                            except TimeoutException:
+                                logger.warning(f"Страница {page_num} не загрузилась после смены прокси — скип")
+                                continue
+                            time.sleep(3)
+
+                # Жёсткий бан — удаляем прокси и пробуем другие
+                while self.is_proxy_blocked(driver):
+                    if not PROXY_LIST:
+                        logger.error("Все прокси забанены, продолжаем без прокси")
+                        break
+                    driver = self.switch_proxy(driver)
+                    try:
+                        driver.get(page_url)
+                    except TimeoutException:
+                        continue
+                    time.sleep(3)
+                    if self.is_browser_check(driver):
+                        if not self.wait_for_browser_check(driver, timeout=15):
+                            continue
 
                 # Проверяем капчу сразу после загрузки страницы категории
                 if self.is_captcha_page(driver):
                     logger.warning(f"Капча на странице категории {page_num}")
                     self.handle_captcha(driver, page_url)
                     if 'captcha' in driver.current_url.lower():
-                        driver.get(page_url)
+                        try:
+                            driver.get(page_url)
+                        except TimeoutException:
+                            logger.warning(f"Страница {page_num} не загрузилась после капчи — скип")
+                            continue
                         time.sleep(2)
 
                 self.human_like_actions(driver)
@@ -792,7 +1007,11 @@ class ChipDipScraper:
                     if self.is_captcha_page(driver):
                         logger.warning(f"Таймаут из-за капчи на стр. {page_num}")
                         self.handle_captcha(driver, page_url)
-                        driver.get(page_url)
+                        try:
+                            driver.get(page_url)
+                        except TimeoutException:
+                            logger.warning(f"Страница {page_num} не загрузилась после капчи — скип")
+                            continue
                         WebDriverWait(driver, 15).until(
                             EC.presence_of_element_located((By.CSS_SELECTOR, "tr.with-hover a.link"))
                         )
@@ -824,7 +1043,7 @@ class ChipDipScraper:
                 continue
 
         logger.info(f"Category completed: {len(category_components)} products from pages {start_page}-{end_page}")
-        return category_components
+        return category_components, driver
 
     def save_results(self, components, filename):
         if not components:
@@ -855,6 +1074,8 @@ class ChipDipScraper:
 
     def run(self):
         logger.info("Starting chipdip scraper")
+        if PROXY_LIST:
+            logger.info(f"Загружено {len(PROXY_LIST)} прокси")
         start_time = time.time()
 
         driver = self.setup_driver()
@@ -876,7 +1097,7 @@ class ChipDipScraper:
                 return
 
             # Парсим выбранный диапазон страниц
-            components = self.parse_category_page_range(driver, category_url, category_name, start_page, end_page)
+            components, driver = self.parse_category_page_range(driver, category_url, category_name, start_page, end_page)
 
             # Создаем имя файла с категорией и диапазоном страниц
             safe_category_name = "".join(c for c in category_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
@@ -890,6 +1111,15 @@ class ChipDipScraper:
 
         finally:
             driver.quit()
+
+            # Выводим оставшиеся рабочие прокси
+            if PROXY_LIST:
+                print(f"\n=== Оставшиеся рабочие прокси ({len(PROXY_LIST)}) ===")
+                for p in PROXY_LIST:
+                    print(f"  {p['host']}:{p['port']}:{p['user']}:{p['pass']}")
+                print("=== Конец списка ===\n")
+            else:
+                print("\n⚠ Все прокси были забанены!\n")
 
 
 if __name__ == "__main__":
