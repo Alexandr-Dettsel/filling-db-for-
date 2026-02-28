@@ -10,9 +10,10 @@ import json
 import os
 import zipfile
 import tempfile
+import base64
+import struct
 from dataclasses import dataclass
 import logging
-import argparse
 import re
 from twocaptcha import TwoCaptcha
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -305,28 +306,34 @@ class AmperoScraper:
 
             img_element = driver.find_element(By.CSS_SELECTOR, "div.AdvancedCaptcha-ImageWrapper img")
 
-            img_width = img_element.size['width']
-            img_height = img_element.size['height']
+            # Логические CSS пиксели (в них работает move_to_element_with_offset)
+            sel_w = img_element.size['width']
+            sel_h = img_element.size['height']
 
-            original_width = driver.execute_script("return arguments[0].naturalWidth;", img_element)
-            original_height = driver.execute_script("return arguments[0].naturalHeight;", img_element)
+            # screenshot_as_base64 делает скриншот в физических пикселях (sel * dpr).
+            # 2captcha получила картинку этого размера и дала координаты для неё.
+            # Читаем реальный размер PNG из заголовка IHDR и масштабируем координаты обратно.
+            png_bytes = base64.b64decode(img_element.screenshot_as_base64)
+            screenshot_w = struct.unpack('>I', png_bytes[16:20])[0]
+            screenshot_h = struct.unpack('>I', png_bytes[20:24])[0]
 
-            scale_x = img_width / original_width
-            scale_y = img_height / original_height
-            action = ActionChains(driver)
+            coord_scale_x = sel_w / screenshot_w if screenshot_w else 1
+            coord_scale_y = sel_h / screenshot_h if screenshot_h else 1
+
+            logger.info(f"Img CSS={sel_w}x{sel_h}  screenshot={screenshot_w}x{screenshot_h}  scale={coord_scale_x:.3f}x{coord_scale_y:.3f}")
 
             for i, coord in enumerate(coordinates, 1):
-                scaled_x = int(coord['x'] * scale_x)
-                scaled_y = int(coord['y'] * scale_y)
+                click_x = coord['x'] * coord_scale_x
+                click_y = coord['y'] * coord_scale_y
+                offset_x = int(click_x - sel_w / 2)
+                offset_y = int(click_y - sel_h / 2)
 
-                offset_x = scaled_x - (img_width // 2)
-                offset_y = scaled_y - (img_height // 2)
+                logger.info(f"Клик {i}: orig=({coord['x']},{coord['y']}) -> offset=({offset_x},{offset_y})")
 
-                action.move_to_element_with_offset(
-                    img_element,
-                    offset_x,
-                    offset_y
-                ).click().perform()
+                ActionChains(driver)\
+                    .move_to_element_with_offset(img_element, offset_x, offset_y)\
+                    .click()\
+                    .perform()
                 time.sleep(0.8)
 
             driver.switch_to.default_content()

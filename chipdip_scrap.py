@@ -3,15 +3,21 @@ from selenium.webdriver.edge.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import NoSuchElementException, TimeoutException
 import time
 import random
 import json
 import os
+import base64
+import struct
 from dataclasses import dataclass
 import logging
-import argparse
 import re
+from twocaptcha import TwoCaptcha
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.getLogger('selenium').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
@@ -24,6 +30,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.chipdip.ru"
+API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "---")
 
 
 @dataclass
@@ -42,6 +49,7 @@ class ChipDipScraper:
     def __init__(self):
         self.components = []
         self.create_directories()
+        self.solver = TwoCaptcha(API_KEY)
 
     def create_directories(self):
         directories = [
@@ -89,11 +97,339 @@ class ChipDipScraper:
         except:
             pass
 
+    def is_captcha_page(self, driver):
+        try:
+            # chipdip редиректит на /forms/captcha2
+            if 'captcha' in driver.current_url.lower():
+                return True
+            # Проверяем наличие контейнера капчи на странице
+            if driver.find_elements(By.CSS_SELECTOR, "div#captcha-container, div.captcha-w, form#captcha_form"):
+                return True
+            return False
+        except:
+            return False
+
+    def get_captcha_type(self, driver):
+        """Определяет тип капчи по наличию iframe"""
+        try:
+            # Сложная капча — появляется в div.SmartCaptcha-Overlay после клика по чекбоксу
+            # Ищем везде на странице, не только в captcha-w
+            if driver.find_elements(By.CSS_SELECTOR,
+                    "div.SmartCaptcha-Overlay iframe[data-testid='advanced-iframe'], "
+                    "iframe[data-testid='advanced-iframe']"):
+                return 'difficult'
+            # Простая капча — checkbox-iframe внутри captcha-container
+            if driver.find_elements(By.CSS_SELECTOR, "iframe[data-testid='checkbox-iframe']"):
+                return 'simple'
+            # iframe ещё не появился — ждём до 5 секунд
+            for _ in range(5):
+                time.sleep(1)
+                if driver.find_elements(By.CSS_SELECTOR,
+                        "div.SmartCaptcha-Overlay iframe[data-testid='advanced-iframe'], "
+                        "iframe[data-testid='advanced-iframe']"):
+                    return 'difficult'
+                if driver.find_elements(By.CSS_SELECTOR, "iframe[data-testid='checkbox-iframe']"):
+                    return 'simple'
+        except:
+            pass
+        return None
+
+    def solver_simple_captcha(self, driver):
+        try:
+            time.sleep(2)
+            # Капча внутри iframe — нужно переключиться в него
+            iframe = WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[data-testid='checkbox-iframe']"))
+            )
+            logger.info("Найден checkbox-iframe, переключаемся...")
+            driver.switch_to.frame(iframe)
+
+            checkbox = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.ID, "js-button"))
+            )
+            logger.info("Найдена кнопка js-button внутри iframe")
+
+            try:
+                ActionChains(driver).move_to_element(checkbox).click().perform()
+            except Exception:
+                driver.execute_script("arguments[0].click();", checkbox)
+
+            time.sleep(3)
+            driver.switch_to.default_content()
+            logger.info("Простая капча — клик выполнен")
+            return True
+        except Exception as e:
+            logger.warning(f"Ошибка решения простой капчи: {e}")
+            driver.switch_to.default_content()
+            return False
+
+    def get_captcha_images(self, driver):
+        try:
+            time.sleep(2)
+            # advanced-iframe находится в div.SmartCaptcha-Overlay (вне div.captcha-w)
+            iframe = WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[data-testid='advanced-iframe']"))
+            )
+            logger.info("Найден advanced-iframe, переключаемся...")
+            driver.switch_to.frame(iframe)
+
+            # Ждём загрузки содержимого iframe
+            main_img_element = WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "div.AdvancedCaptcha-ImageWrapper img"))
+            )
+            main_image = main_img_element.screenshot_as_base64
+
+            try:
+                instruction_img_element = driver.find_element(By.CSS_SELECTOR, "img.TaskImage")
+                instruction_image = instruction_img_element.screenshot_as_base64
+            except:
+                instruction_image = main_image
+
+            logger.info("Получены изображения сложной капчи из iframe")
+            # НЕ делаем switch_to.default_content() — нужен для кликов и submit
+            return main_image, instruction_image, main_img_element
+        except Exception as e:
+            logger.warning(f"Ошибка получения изображений: {e}")
+            driver.switch_to.default_content()
+            return None, None, None
+
+    def parse_coordinates(self, coords_string):
+        coords_string = coords_string.replace("coordinates:", "").strip()
+        coordinates = []
+        for pair in coords_string.split(";"):
+            if "," not in pair:
+                continue
+            parts = pair.split(",")
+            x = int(parts[0].split("=")[1])
+            y = int(parts[1].split("=")[1])
+            coordinates.append({"x": x, "y": y})
+        return coordinates
+
+    def click_silhouettes(self, driver, coordinates):
+        try:
+            img_element = driver.find_element(By.CSS_SELECTOR, "div.AdvancedCaptcha-ImageWrapper img")
+
+            # Логические CSS пиксели (в них работает move_to_element_with_offset)
+            sel_w = img_element.size['width']
+            sel_h = img_element.size['height']
+
+            # screenshot_as_base64 делает скриншот в физических пикселях (sel * dpr).
+            # 2captcha получила картинку этого размера и дала координаты для неё.
+            # Читаем реальный размер PNG из заголовка IHDR и масштабируем координаты обратно.
+            png_bytes = base64.b64decode(img_element.screenshot_as_base64)
+            screenshot_w = struct.unpack('>I', png_bytes[16:20])[0]
+            screenshot_h = struct.unpack('>I', png_bytes[20:24])[0]
+
+            coord_scale_x = sel_w / screenshot_w if screenshot_w else 1
+            coord_scale_y = sel_h / screenshot_h if screenshot_h else 1
+
+            logger.info(f"Img CSS={sel_w}x{sel_h}  screenshot={screenshot_w}x{screenshot_h}  scale={coord_scale_x:.3f}x{coord_scale_y:.3f}")
+
+            for i, coord in enumerate(coordinates, 1):
+                click_x = coord['x'] * coord_scale_x
+                click_y = coord['y'] * coord_scale_y
+                offset_x = int(click_x - sel_w / 2)
+                offset_y = int(click_y - sel_h / 2)
+
+                logger.info(f"Клик {i}: orig=({coord['x']},{coord['y']}) -> offset=({offset_x},{offset_y})")
+
+                ActionChains(driver)\
+                    .move_to_element_with_offset(img_element, offset_x, offset_y)\
+                    .click()\
+                    .perform()
+                time.sleep(0.8)
+
+            logger.info("✓ Все клики выполнены")
+            return True
+
+        except Exception as e:
+            logger.error(f"Ошибка кликов: {e}")
+            return False
+
+    def refresh_captcha(self, driver):
+        """Нажимает кнопку 'Обновить задание' внутри advanced-iframe"""
+        try:
+            refresh_btn = driver.find_element(By.CSS_SELECTOR, "button[data-testid='refresh']")
+            refresh_btn.click()
+            logger.info("Капча обновлена (кнопка refresh)")
+            time.sleep(3)  # Ждём загрузки нового задания
+            return True
+        except Exception as e:
+            logger.warning(f"Не удалось нажать refresh: {e}")
+            return False
+
+    def solver_difficult_captcha(self, driver):
+        last_captcha_id = None
+
+        for inner_attempt in range(3):
+            try:
+                if inner_attempt > 0:
+                    logger.info(f"Внутренняя попытка {inner_attempt + 1}/3 сложной капчи")
+                    # Репортим предыдущее неверное решение в 2captcha
+                    if last_captcha_id:
+                        try:
+                            self.solver.report(last_captcha_id, False)
+                            logger.info(f"Репорт об ошибке отправлен в 2captcha (id={last_captcha_id})")
+                        except Exception as e:
+                            logger.warning(f"Не удалось отправить репорт: {e}")
+
+                    # Обновляем задание капчи
+                    self.refresh_captcha(driver)
+
+                # get_captcha_images переключает в advanced-iframe и остаётся в нём
+                main_img, instruction_img, _ = self.get_captcha_images(driver)
+                if not main_img or not instruction_img:
+                    logger.warning("Не получили изображения сложной капчи")
+                    driver.switch_to.default_content()
+                    time.sleep(3)
+                    continue
+
+                logger.info(f"Отправка в 2captcha (попытка {inner_attempt + 1})...")
+                result = self.solver.coordinates(
+                    file=f"data:image/png;base64,{main_img}",
+                    hintImg=f"data:image/png;base64,{instruction_img}"
+                )
+                last_captcha_id = result.get('captchaId') or result.get('id')
+                coordinates = self.parse_coordinates(result['code'])
+                logger.info(f"2captcha ответил: {result['code']} (id={last_captcha_id})")
+
+                # Кликаем — click_silhouettes сам переключается default->iframe->default->iframe
+                # Скриншот делаем пока мы внутри iframe (после get_captcha_images)
+                try:
+                    driver.save_screenshot(f"debug_captcha_attempt_{inner_attempt+1}.png")
+                    logger.info(f"Скриншот сохранён: debug_captcha_attempt_{inner_attempt+1}.png")
+                except:
+                    pass
+
+                # Кликаем — мы внутри advanced-iframe
+                self.click_silhouettes(driver, coordinates)
+                time.sleep(1)
+
+                # Submit внутри iframe
+                try:
+                    submit_btn = WebDriverWait(driver, 10).until(
+                        EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-testid='submit']"))
+                    )
+                    submit_btn.click()
+                    logger.info("Submit нажат, ждём реакции капчи...")
+                except TimeoutException:
+                    driver.execute_script(
+                        "document.querySelector('button[data-testid=\"submit\"]').click();"
+                    )
+
+                # Ждём 5 сек — появится либо ошибка ("Попробуйте ещё раз") либо закроется overlay
+                time.sleep(5)
+                driver.switch_to.default_content()
+
+                # Проверяем — закрылся ли overlay (капча пройдена)
+                overlay_still_visible = driver.find_elements(
+                    By.CSS_SELECTOR, "div.SmartCaptcha-Overlay_visible, div.SmartCaptcha-Overlay"
+                )
+                if not overlay_still_visible:
+                    logger.info("✓ Overlay исчез — сложная капча пройдена!")
+                    if last_captcha_id:
+                        try:
+                            self.solver.report(last_captcha_id, True)
+                        except:
+                            pass
+                    return True
+
+                # Overlay ещё есть — решение неверное, пробуем снова
+                logger.warning(f"Overlay ещё виден после попытки {inner_attempt + 1} — решение неверное")
+                # Переключаемся обратно в iframe для следующей попытки (refresh)
+                try:
+                    iframe = driver.find_element(By.CSS_SELECTOR, "iframe[data-testid='advanced-iframe']")
+                    driver.switch_to.frame(iframe)
+                except:
+                    pass
+                time.sleep(2)
+
+            except Exception as e:
+                logger.error(f"Ошибка в попытке {inner_attempt + 1} сложной капчи: {e}")
+                driver.switch_to.default_content()
+                time.sleep(3)
+
+        logger.error("Все 3 внутренние попытки сложной капчи исчерпаны")
+        driver.switch_to.default_content()
+        return False
+
+    def _wait_for_redirect(self, driver, timeout=25):
+        """Ждёт редиректа с captcha-страницы. Возвращает True если произошёл."""
+        logger.info(f"Ждём редиректа до {timeout} сек...")
+        for tick in range(timeout):
+            time.sleep(1)
+            if 'captcha' not in driver.current_url.lower():
+                logger.info(f"✓ Редирект на: {driver.current_url}")
+                return True
+            if tick % 5 == 4:
+                logger.info(f"  {tick+1}/{timeout} сек | всё ещё на капче...")
+        logger.warning(f"Редирект не произошёл за {timeout} сек")
+        return False
+
     def handle_captcha(self, driver, url):
-        logger.warning("CAPTCHA detected - manual intervention required")
-        input("Solve CAPTCHA in browser and press Enter to continue...")
-        driver.get(url)
-        self.random_sleep(3, 5)
+        logger.info("Обнаружена капча, начинаем автоматическое решение...")
+        logger.info(f"Текущий URL: {driver.current_url}")
+
+        max_attempts = 2  # solver_difficult_captcha сам делает 3 попытки внутри
+        for attempt in range(max_attempts):
+            logger.info(f"--- Попытка {attempt + 1}/{max_attempts} ---")
+
+            captcha_type = self.get_captcha_type(driver)
+            logger.info(f"Определён тип капчи: {captcha_type}")
+
+            if captcha_type == 'simple':
+                logger.info("Решаем простую капчу (чекбокс)...")
+                if not self.solver_simple_captcha(driver):
+                    logger.warning("Не удалось нажать чекбокс, пауза 5 сек...")
+                    time.sleep(5)
+                    continue
+
+                logger.info("Чекбокс нажат. Ждём до 20 сек — редирект или сложная капча...")
+                advanced_found = False
+                for tick in range(20):
+                    time.sleep(1)
+                    if 'captcha' not in driver.current_url.lower():
+                        logger.info(f"✓ Простая капча пройдена! URL: {driver.current_url}")
+                        return True
+                    overlay = driver.find_elements(By.CSS_SELECTOR,
+                        "div.SmartCaptcha-Overlay, iframe[data-testid='advanced-iframe']")
+                    if overlay:
+                        logger.info(f"  tick {tick+1}: Появился SmartCaptcha-Overlay!")
+                        advanced_found = True
+                        break
+                    if tick % 5 == 4:
+                        logger.info(f"  tick {tick+1}/20 | URL: {driver.current_url}")
+
+                if advanced_found:
+                    logger.info("Ждём 3 сек полной загрузки iframe...")
+                    time.sleep(3)
+                    if self.solver_difficult_captcha(driver):
+                        if self._wait_for_redirect(driver, timeout=25):
+                            return True
+                    logger.warning("Сложная капча после чекбокса не решена")
+                else:
+                    logger.warning("За 20 сек ни редиректа ни сложной капчи")
+
+            elif captcha_type == 'difficult':
+                logger.info("Решаем сложную капчу напрямую...")
+                if self.solver_difficult_captcha(driver):
+                    if self._wait_for_redirect(driver, timeout=25):
+                        return True
+                logger.warning("Сложная капча не решена")
+
+            else:
+                logger.warning("Тип капчи не определён, ждём 5 сек...")
+                time.sleep(5)
+
+            logger.warning(f"Попытка {attempt + 1} не удалась, пауза 5 сек...")
+            time.sleep(5)
+
+        # Все попытки исчерпаны — ручное решение
+        logger.error("Все автоматические попытки исчерпаны!")
+        print("\n===-===- КАПЧА НЕ РЕШЕНА АВТОМАТИЧЕСКИ =-==-===")
+        print("Решите капчу в браузере вручную и нажмите Enter")
+        input("Нажмите Enter после решения капчи...")
+        time.sleep(2)
 
     def get_category_from_user(self):
         """Запрашивает у пользователя URL категории"""
@@ -142,7 +478,15 @@ class ChipDipScraper:
     def get_product_features(self, driver, url, category):
         try:
             driver.get(url)
-            self.random_sleep(3, 6)
+
+            # Сразу проверяем капчу (chipdip редиректит на /forms/captcha2)
+            if self.is_captcha_page(driver):
+                logger.warning(f"Капча обнаружена при загрузке товара")
+                self.handle_captcha(driver, url)
+                # После решения капчи повторно загружаем нужную страницу
+                if 'captcha' in driver.current_url.lower():
+                    driver.get(url)
+                    time.sleep(2)
 
             if random.random() > 0.3:
                 self.human_like_actions(driver)
@@ -152,7 +496,8 @@ class ChipDipScraper:
                 product_name = name_product.text
                 logger.info(f"Product: {product_name}")
             except NoSuchElementException:
-                self.handle_captcha(driver, url)
+                if self.is_captcha_page(driver):
+                    self.handle_captcha(driver, url)
                 return self.get_product_features(driver, url, category)
 
             # Извлекаем номенклатурный номер (ТУ)
@@ -166,7 +511,6 @@ class ChipDipScraper:
                 button = driver.find_element(By.CSS_SELECTOR,
                                              'span.link.link_pseudo.link_showhide.f-size.with-icon.with-icon_right.with-icon_sort-down')
                 driver.execute_script("arguments[0].click();", button)
-                time.sleep(random.uniform(1, 2))
             except NoSuchElementException:
                 pass
 
@@ -429,7 +773,15 @@ class ChipDipScraper:
 
             try:
                 driver.get(page_url)
-                self.random_sleep(3, 6)
+
+                # Проверяем капчу сразу после загрузки страницы категории
+                if self.is_captcha_page(driver):
+                    logger.warning(f"Капча на странице категории {page_num}")
+                    self.handle_captcha(driver, page_url)
+                    if 'captcha' in driver.current_url.lower():
+                        driver.get(page_url)
+                        time.sleep(2)
+
                 self.human_like_actions(driver)
 
                 try:
@@ -437,8 +789,16 @@ class ChipDipScraper:
                         EC.presence_of_element_located((By.CSS_SELECTOR, "tr.with-hover a.link"))
                     )
                 except TimeoutException:
-                    logger.info(f"No products found on page {page_num} - stopping")
-                    break
+                    if self.is_captcha_page(driver):
+                        logger.warning(f"Таймаут из-за капчи на стр. {page_num}")
+                        self.handle_captcha(driver, page_url)
+                        driver.get(page_url)
+                        WebDriverWait(driver, 15).until(
+                            EC.presence_of_element_located((By.CSS_SELECTOR, "tr.with-hover a.link"))
+                        )
+                    else:
+                        logger.info(f"No products found on page {page_num} - stopping")
+                        break
 
                 product_elements = driver.find_elements(By.CSS_SELECTOR, "tr.with-hover a.link")
                 product_urls = [el.get_attribute('href') for el in product_elements]
@@ -456,11 +816,9 @@ class ChipDipScraper:
                         category_components.append(component)
 
                     if i < len(product_urls) - 1:
-                        self.random_sleep(2, 4)
-
+                        continue
                 if page_num < end_page:
-                    time.sleep(random.uniform(4, 8))
-
+                    continue
             except Exception as e:
                 logger.error(f"Error processing page {page_num}: {e}")
                 continue
@@ -535,8 +893,6 @@ class ChipDipScraper:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='ChipDip Scraper')
-    args = parser.parse_args()
 
     scraper = ChipDipScraper()
     scraper.run()
