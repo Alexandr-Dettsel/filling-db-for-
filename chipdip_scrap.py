@@ -20,6 +20,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
+# Папка где лежит сам скрипт — все пути строятся относительно неё
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 logging.getLogger('selenium').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('selenium.webdriver.remote.remote_connection').setLevel(logging.WARNING)
@@ -90,11 +93,12 @@ class ChipDipScraper:
         self.create_directories()
         self.solver = TwoCaptcha(API_KEY)
         self._rotate_every = 1  # менять прокси каждые N страниц категории
+        self._autosave_file = None  # путь к файлу автосохранения текущей сессии
 
     def create_directories(self):
         directories = [
-            'data',
-            'data/results'
+            os.path.join(BASE_DIR, 'data'),
+            os.path.join(BASE_DIR, 'data', 'results')
         ]
         for directory in directories:
             os.makedirs(directory, exist_ok=True)
@@ -1162,7 +1166,7 @@ class ChipDipScraper:
             url += '?ps=x3'
         return url
 
-    def parse_category_page_range(self, driver, category_url, category_name, start_page, end_page):
+    def parse_category_page_range(self, driver, category_url, category_name, start_page, end_page, autosave_filepath=None):
         """Парсит указанный диапазон страниц категории"""
         logger.info(f"Parsing category: {category_name}, pages {start_page}-{end_page}")
 
@@ -1268,14 +1272,18 @@ class ChipDipScraper:
 
                 logger.info(f"Found {len(product_urls)} products on page {page_num}")
 
+                page_components = []
                 for i, product_url in enumerate(product_urls):
                     logger.info(f"Parsing product {i + 1}/{len(product_urls)} on page {page_num}")
                     component = self.get_product_features(driver, product_url, category_name)
                     if component:
                         category_components.append(component)
+                        page_components.append(component)
 
-                    if i < len(product_urls) - 1:
-                        continue
+                # Автосохранение после каждой страницы
+                if autosave_filepath and page_components:
+                    self.save_results_incremental(page_components, autosave_filepath, page_num)
+
                 if page_num < end_page:
                     continue
             except Exception as e:
@@ -1290,7 +1298,7 @@ class ChipDipScraper:
             logger.warning("No components to save")
             return
 
-        filepath = os.path.join('data', 'results', filename)
+        filepath = os.path.join(BASE_DIR, 'data', 'results', filename)
 
         data = []
         for comp in components:
@@ -1316,6 +1324,58 @@ class ChipDipScraper:
         except Exception as e:
             logger.error(f"Error saving to {filepath}: {e}")
 
+    def _component_to_dict(self, comp):
+        """Конвертирует компонент в словарь для сохранения"""
+        item = {
+            'name': comp.name,
+            'tu_number': comp.tu_number,
+            'manufacturer': comp.manufacturer,
+            'supplier': comp.supplier,
+            'source': comp.source,
+            'article': comp.article,
+            'url': comp.url,
+            'category': comp.category,
+            'voltage': comp.voltage
+        }
+        item.update(comp.all_specs)
+        return item
+
+    def save_results_incremental(self, new_components, filepath, page_num):
+        """Дописывает новые компоненты в файл после каждой страницы.
+        Читает существующий файл, объединяет и перезаписывает — безопасно при краше."""
+        if not new_components:
+            return
+
+        existing_data = []
+        if os.path.exists(filepath):
+            try:
+                with open(filepath, 'r', encoding='utf-8') as f:
+                    existing_data = json.load(f)
+            except Exception as e:
+                logger.warning(f"Не удалось прочитать существующий файл: {e}")
+
+        new_data = [self._component_to_dict(c) for c in new_components]
+        all_data = existing_data + new_data
+
+        try:
+            with open(filepath, 'w', encoding='utf-8') as f:
+                json.dump(all_data, f, ensure_ascii=False, indent=2)
+            logger.info(f"✓ Автосохранение после стр. {page_num}: +{len(new_data)} товаров "
+                        f"(всего в файле: {len(all_data)}) → {filepath}")
+        except Exception as e:
+            logger.error(f"Ошибка автосохранения: {e}")
+
+    def _load_existing_results(self, filepath):
+        """Загружает уже сохранённые результаты и возвращает количество записей"""
+        if not os.path.exists(filepath):
+            return 0
+        try:
+            with open(filepath, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+            return len(data)
+        except Exception:
+            return 0
+
     def run(self):
         logger.info("Starting chipdip scraper")
         if PROXY_LIST:
@@ -1340,18 +1400,41 @@ class ChipDipScraper:
             if start_page is None or end_page is None:
                 return
 
-            # Парсим выбранный диапазон страниц
-            components, driver = self.parse_category_page_range(driver, category_url, category_name, start_page, end_page)
-
-            # Создаем имя файла с категорией и диапазоном страниц
+            # Формируем имя файла ДО начала парсинга (для автосохранения)
             safe_category_name = "".join(c for c in category_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
             safe_category_name = safe_category_name.replace(' ', '_')
             filename = f"{safe_category_name}_pages_{start_page}_to_{end_page}.json"
+            autosave_filepath = os.path.join(BASE_DIR, 'data', 'results', filename)
 
-            self.save_results(components, filename)
+            # Проверяем — есть ли уже частично сохранённые данные
+            existing_count = self._load_existing_results(autosave_filepath)
+            if existing_count > 0:
+                print(f"\n⚠ Найден файл с предыдущими данными: {autosave_filepath}")
+                print(f"   Уже сохранено записей: {existing_count}")
+                answer = input("Продолжить дозапись в этот файл? (y/n, Enter=y): ").strip().lower()
+                if answer == 'n':
+                    print("Файл будет перезаписан с нуля.")
+                    try:
+                        os.remove(autosave_filepath)
+                    except Exception:
+                        pass
+                else:
+                    print(f"Продолжаем — новые данные добавятся к существующим {existing_count} записям.")
 
+            logger.info(f"Автосохранение активировано → {autosave_filepath}")
+
+            # Парсим выбранный диапазон страниц
+            components, driver = self.parse_category_page_range(
+                driver, category_url, category_name, start_page, end_page,
+                autosave_filepath=autosave_filepath
+            )
+
+            total_in_file = self._load_existing_results(autosave_filepath)
             total_time = time.time() - start_time
             logger.info(f"Scraping completed in {total_time:.1f} seconds")
+            logger.info(f"Итого записей в файле: {total_in_file} → {autosave_filepath}")
+            print(f"\n✓ Готово! Всего записей в файле: {total_in_file}")
+            print(f"  Файл: {autosave_filepath}")
 
         finally:
             driver.quit()
