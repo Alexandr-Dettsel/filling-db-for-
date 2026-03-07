@@ -12,7 +12,7 @@ import os
 import base64
 import struct
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import logging
 import re
 from twocaptcha import TwoCaptcha
@@ -80,6 +80,8 @@ class ElectronicComponent:
     article: str = ""  # Артикул из URL
     url: str = ""
     category: str = ""
+    voltage: str = ""
+    all_specs: dict = field(default_factory=dict)
 
 
 class ChipDipScraper:
@@ -676,34 +678,62 @@ class ChipDipScraper:
             manufacturer = self.extract_brand(driver)
             logger.info(f"Manufacturer extracted: {manufacturer}")
 
+            # Извлекаем напряжение
+            voltage = self.extract_voltage(driver)
+
+            # --- БЛОК СБОРА ВСЕХ ПАРАМЕТРОВ ---
+            all_specs = {}
+
+            # 1. Раскрываем список "Показать еще", если он есть
             try:
-                button = driver.find_element(By.CSS_SELECTOR,
-                                             'span.link.link_pseudo.link_showhide.f-size.with-icon.with-icon_right.with-icon_sort-down')
-                driver.execute_script("arguments[0].click();", button)
-                time.sleep(random.uniform(1, 2))
-            except NoSuchElementException:
+                expand_button = driver.find_elements(By.CSS_SELECTOR, 'span.link_showhide')
+                if expand_button:
+                    driver.execute_script("arguments[0].click();", expand_button[0])
+                    time.sleep(0.5)
+            except Exception:
                 pass
 
+            # 2. Собираем все строки из таблицы параметров
+            try:
+                rows = driver.find_elements(By.CSS_SELECTOR, "table#productparams tr")
+
+                for row in rows:
+                    try:
+                        name_el = row.find_element(By.CLASS_NAME, 'product__param-name')
+                        value_el = row.find_element(By.CLASS_NAME, 'product__param-value')
+
+                        p_name = name_el.text.strip().replace(':', '')
+                        p_value = value_el.text.strip()
+
+                        if p_name and p_value:
+                            all_specs[p_name] = p_value
+                    except NoSuchElementException:
+                        continue
+            except Exception as e:
+                logger.warning(f"Ошибка сбора параметров: {e}")
+
+            # Определяем поставщика
             names = driver.find_elements(By.CLASS_NAME, 'product__param-name')
             values = driver.find_elements(By.CLASS_NAME, 'product__param-value')
-
-            params = {}
+            supplier = "Чип и Дип"
             for name, value in zip(names, values):
-                param_name = name.text.strip().lower()
-                param_value = value.text.strip()
-                params[param_name] = param_value
+                if 'поставщик' in name.text.lower():
+                    supplier = value.text.strip()
+                    break
 
             # Оставляем артикул из URL как было
             article = self.extract_article_from_url(url)
 
             component = ElectronicComponent(
                 name=product_name,
-                tu_number=tu_number,  # Номенклатурный номер ChipDip
-                manufacturer=manufacturer,  # Бренд (производитель)
-                supplier=params.get('поставщик', 'Чип и Дип'),
-                article=article,  # Артикул из URL
+                tu_number=tu_number,
+                manufacturer=manufacturer,
+                supplier=supplier,
+                article=article,
                 url=url,
-                category=category
+                category=category,
+                voltage=voltage,
+                all_specs=all_specs
             )
 
             return component
@@ -715,13 +745,29 @@ class ChipDipScraper:
     def extract_tu_number(self, driver):
         """Извлекает номенклатурный номер (ТУ) со страницы товара"""
         try:
-            # Ищем элемент с номенклатурным номером
+            xpaths = [
+                "//*[contains(text(), 'Номенклатурный номер')]/following-sibling::*",
+                "//*[contains(text(), 'Номенклатурный номер')]/../*[last()]",
+                "//*[contains(text(), 'Номенклатурный номер')]/..//*[contains(@class, 'product__code')]",
+            ]
+
+            for xpath in xpaths:
+                try:
+                    elements = driver.find_elements(By.XPATH, xpath)
+                    for element in elements:
+                        text = element.text.strip()
+                        numbers = re.findall(r'\d+', text)
+                        if numbers and len(numbers[0]) >= 3:
+                            return numbers[0]
+                except:
+                    continue
+
             selectors = [
                 "div.product__code",
                 "span.product__code",
                 ".product__code",
                 "div[class*='code']",
-                "span[class*='code']"
+                "span[class*='code']",
             ]
 
             for selector in selectors:
@@ -729,38 +775,220 @@ class ChipDipScraper:
                     elements = driver.find_elements(By.CSS_SELECTOR, selector)
                     for element in elements:
                         text = element.text.strip()
-                        if text and any(word in text.lower() for word in ['номенкл', 'номер', 'код']):
-                            # Извлекаем только цифры из текста
-                            numbers = re.findall(r'\d+', text)
-                            if numbers:
+                        numbers = re.findall(r'\d+', text)
+                        if numbers and len(numbers[0]) >= 3:
+                            if not re.search(r'[a-zA-Z]', text):
                                 return numbers[0]
                 except:
                     continue
 
-            # Альтернативный метод: ищем по структуре страницы
             try:
-                # Ищем рядом с текстом "Номенклатурный номер"
-                xpath_selectors = [
-                    "//*[contains(text(), 'Номенклатурный номер')]/following-sibling::*",
-                    "//*[contains(text(), 'Номенклатурный номер')]/../*[last()]",
-                    "//div[contains(@class, 'product__info')]//*[contains(text(), '900')]"
-                ]
-
-                for xpath in xpath_selectors:
-                    try:
-                        elements = driver.find_elements(By.XPATH, xpath)
-                        for element in elements:
-                            text = element.text.strip()
-                            numbers = re.findall(r'\d+', text)
-                            if numbers and len(numbers[0]) >= 6:  # Номера обычно длинные
-                                return numbers[0]
-                    except:
-                        continue
+                page_text = driver.find_element(By.TAG_NAME, "body").text
+                pattern = r'Номенклатурный номер[\s:\-]*(\d+)'
+                match = re.search(pattern, page_text, re.IGNORECASE)
+                if match:
+                    return match.group(1)
             except:
                 pass
 
         except Exception as e:
-            logger.warning(f"Could not extract TU number: {e}")
+            logger.warning(f"Не удалось извлечь ТУ номер: {e}")
+
+        return ""
+
+    def extract_voltage(self, driver):
+        """Метод извлечения напряжения"""
+        try:
+            voltage = self._extract_from_parameters_table_improved(driver)
+            if voltage:
+                return voltage
+            voltage = self._extract_from_description_improved(driver)
+            if voltage:
+                return voltage
+            voltage = self._extract_from_other_sections_improved(driver)
+            if voltage:
+                return voltage
+
+        except Exception as e:
+            logger.warning(f"Ошибка при извлечении напряжения: {e}")
+
+        return ""
+
+    def _extract_from_parameters_table_improved(self, driver):
+        try:
+            param_rows = driver.find_elements(By.CSS_SELECTOR, ".product__param-row")
+
+            voltage_patterns = [
+                "напряжение питания",
+                "supply voltage",
+                "voltage - supply",
+                "voltage supply",
+                "working voltage",
+                "operating voltage",
+                "питание",
+                "vcc",
+                "vdd",
+                "input voltage",
+                "рабочее напряжение",
+                "входное напряжение",
+                "напряжение"
+            ]
+
+            for row in param_rows:
+                try:
+                    name_elem = row.find_element(By.CSS_SELECTOR, ".product__param-name")
+                    value_elem = row.find_element(By.CSS_SELECTOR, ".product__param-value")
+
+                    param_name = name_elem.text.strip().lower()
+                    param_value = value_elem.text.strip()
+
+                    for pattern in voltage_patterns:
+                        if pattern in param_name:
+                            voltage = self._clean_voltage_string_improved(param_value)
+                            if voltage:
+                                logger.info(f"Найдено напряжение в таблице параметров: {voltage} из '{param_value}'")
+                                return voltage
+
+                    if any(word in param_name for word in ['voltage', 'vcc', 'vdd']):
+                        voltage = self._clean_voltage_string_improved(param_value)
+                        if voltage:
+                            logger.info(f"Найдено напряжение (англ): {voltage} из '{param_value}'")
+                            return voltage
+
+                except Exception as e:
+                    logger.debug(f"Ошибка в строке параметра: {e}")
+                    continue
+
+        except Exception as e:
+            logger.debug(f"Ошибка при поиске в таблице параметров: {e}")
+
+        return ""
+
+    def _extract_from_description_improved(self, driver):
+        try:
+            description_selectors = [
+                ".product__description",
+                ".product-details__description",
+                ".description",
+                "[itemprop='description']",
+                ".product-info__description",
+                ".product__text"
+            ]
+
+            for selector in description_selectors:
+                try:
+                    desc_elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    for desc_element in desc_elements:
+                        desc_text = desc_element.text
+                        voltage = self._find_voltage_in_text_improved(desc_text)
+                        if voltage:
+                            logger.info(f"Найдено напряжение в описании: {voltage}")
+                            return voltage
+                except:
+                    continue
+
+        except Exception as e:
+            logger.debug(f"Ошибка при поиске в описании: {e}")
+
+        return ""
+
+    def _extract_from_other_sections_improved(self, driver):
+        """Улучшенное извлечение из других секций"""
+        try:
+            selectors = [
+                "h1", "h2", "h3",
+                ".product__title",
+                ".product__header",
+                ".product-info",
+                ".specifications"
+            ]
+
+            for selector in selectors:
+                try:
+                    elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                    for element in elements:
+                        text = element.text
+                        voltage = self._find_voltage_in_text_improved(text)
+                        if voltage:
+                            logger.info(f"Найдено напряжение в {selector}: {voltage}")
+                            return voltage
+                except:
+                    continue
+
+            body_text = driver.find_element(By.TAG_NAME, "body").text
+            voltage = self._find_voltage_in_text_improved(body_text)
+            if voltage:
+                logger.info(f"Найдено напряжение в общем тексте страницы: {voltage}")
+                return voltage
+
+        except Exception as e:
+            logger.debug(f"Ошибка при поиске в других секциях: {e}")
+
+        return ""
+
+    def _find_voltage_in_text_improved(self, text):
+        """Улучшенный поиск напряжения в тексте"""
+        if not text:
+            return ""
+
+        patterns = [
+            r'([\d\.,]+)\s*[VВВ]\s*[~\-–—]\s*([\d\.,]+)\s*[VВВ]',
+            r'([\d\.,]+)\s*[VВВ]\s*(?:to|до)\s*([\d\.,]+)\s*[VВВ]',
+            r'([\d\.,]+)\s*[VВВ]\s*[~\-–—]\s*[\d\.,]+\s*[VВВ]\s*,\s*[±±]\s*[\d\.,]+\s*[VВВ]\s*[~\-–—]\s*[\d\.,]+\s*[VВВ]',
+            r'([\d\.,]+)\s*[VВВ](?:\s|$|,|;)',
+            r'([\d\.,]+)\s*[VВВ]\s*[\(\)]',
+            r'[Vv]oltage[\s\-]*[Ss]upply[\s:\-]*([\d\.,…]+)\s*[VВВ]',
+            r'[Ss]upply[\s\-]*[Vv]oltage[\s:\-]*([\d\.,…]+)\s*[VВВ]',
+            r'напряжение[\s\-]*питания[\s:\-]*([\d\.,…]+)\s*[VВВ]',
+            r'[Vv]cc[\s:\-]*([\d\.,…]+)\s*[VВВ]',
+            r'[Vv]dd[\s:\-]*([\d\.,…]+)\s*[VВВ]',
+            r'\(([\d\.,]+)\s*[VВВ]\)',
+            r'\[([\d\.,]+)\s*[VВВ]\]'
+        ]
+
+        for pattern in patterns:
+            try:
+                matches = re.findall(pattern, text, re.IGNORECASE | re.UNICODE)
+                if matches:
+                    for match in matches:
+                        if isinstance(match, tuple):
+                            voltage_str = match[0]
+                        else:
+                            voltage_str = match
+
+                        voltage = self._clean_voltage_string_improved(voltage_str)
+                        if voltage:
+                            logger.info(f"Найдено напряжение по паттерну '{pattern}': {voltage} из '{voltage_str}'")
+                            return voltage
+            except Exception as e:
+                logger.debug(f"Ошибка в паттерне {pattern}: {e}")
+                continue
+
+        return ""
+
+    def _clean_voltage_string_improved(self, voltage_str):
+        if not voltage_str:
+            return ""
+
+        try:
+            clean_str = re.sub(r'[^\d\.,]', '', str(voltage_str).strip())
+
+            if not clean_str:
+                numbers = re.findall(r'[\d\.,]+', str(voltage_str))
+                if numbers:
+                    clean_str = numbers[0]
+
+            clean_str = clean_str.replace(',', '.')
+            parts = clean_str.split('.')
+            if len(parts) > 1:
+                clean_str = parts[0] + '.' + ''.join(parts[1:])
+            voltage_num = float(clean_str)
+
+            if 0.1 <= voltage_num <= 1000:
+                return str(voltage_num)
+
+        except Exception as e:
+            logger.debug(f"Ошибка очистки напряжения '{voltage_str}': {e}")
 
         return ""
 
@@ -923,6 +1151,17 @@ class ChipDipScraper:
             pass
         return ""
 
+    def add_max_items_param(self, url):
+        """Добавляет параметр ps=x3 для максимального количества товаров на странице"""
+        if '?' in url:
+            if 'ps=' in url:
+                url = re.sub(r'ps=[^&]+', 'ps=x3', url)
+            else:
+                url += '&ps=x3'
+        else:
+            url += '?ps=x3'
+        return url
+
     def parse_category_page_range(self, driver, category_url, category_name, start_page, end_page):
         """Парсит указанный диапазон страниц категории"""
         logger.info(f"Parsing category: {category_name}, pages {start_page}-{end_page}")
@@ -940,13 +1179,14 @@ class ChipDipScraper:
                 driver = self.setup_driver()
 
             if page_num == 1:
-                page_url = category_url
+                page_url = self.add_max_items_param(category_url)
             else:
                 base_url = category_url.split('?')[0]
                 if '?' in category_url:
                     page_url = f"{category_url}&page={page_num}"
                 else:
                     page_url = f"{category_url}?page={page_num}"
+                page_url = self.add_max_items_param(page_url)
 
             logger.info(f"Page {page_num} - {page_url}")
 
@@ -1054,16 +1294,20 @@ class ChipDipScraper:
 
         data = []
         for comp in components:
-            data.append({
+            item = {
                 'name': comp.name,
-                'tu_number': comp.tu_number,  # Номенклатурный номер ChipDip
-                'manufacturer': comp.manufacturer,  # Бренд (производитель)
+                'tu_number': comp.tu_number,
+                'manufacturer': comp.manufacturer,
                 'supplier': comp.supplier,
                 'source': comp.source,
-                'article': comp.article,  # Артикул из URL
+                'article': comp.article,
                 'url': comp.url,
-                'category': comp.category
-            })
+                'category': comp.category,
+                'voltage': comp.voltage
+            }
+            # Сливаем базовый словарь с динамическими параметрами
+            item.update(comp.all_specs)
+            data.append(item)
 
         try:
             with open(filepath, 'w', encoding='utf-8') as f:
