@@ -46,7 +46,17 @@ def _parse_proxies():
             continue
         parts = entry.split(":")
         if len(parts) == 4:
+            # host:port:user:pass — прокси с авторизацией
             proxies.append({"host": parts[0], "port": parts[1], "user": parts[2], "pass": parts[3]})
+        elif len(parts) == 2:
+            # host:port — прокси без авторизации
+            proxies.append({"host": parts[0], "port": parts[1], "user": None, "pass": None})
+        else:
+            logger.warning(f"Неверный формат прокси (ожидается host:port или host:port:user:pass): {entry}")
+    # Если USE_OWN_IP=true — добавляем "слот" своего IP в начало (чтобы старт шёл с него)
+    if os.getenv("USE_OWN_IP", "false").lower() in ("1", "true", "yes"):
+        proxies.insert(0, None)
+        logger.info("Свой IP добавлен в пул прокси (USE_OWN_IP=true), старт с него")
     return proxies
 
 
@@ -55,7 +65,7 @@ _proxy_index = 0  # текущий индекс в PROXY_LIST
 
 
 def _next_proxy():
-    """Возвращает следующий прокси по кругу. None если список пуст."""
+    """Возвращает следующий прокси по кругу. None если список пуст или слот своего IP."""
     global _proxy_index
     if not PROXY_LIST:
         return None
@@ -68,7 +78,10 @@ def _remove_proxy(proxy):
     """Удаляет забаненный прокси из списка."""
     try:
         PROXY_LIST.remove(proxy)
-        logger.warning(f"Прокси {proxy['host']}:{proxy['port']} удалён из списка. Осталось: {len(PROXY_LIST)}")
+        if proxy is None:
+            logger.warning("Слот 'свой IP' удалён из пула прокси.")
+        else:
+            logger.warning(f"Прокси {proxy['host']}:{proxy['port']} удалён из списка. Осталось: {len(PROXY_LIST)}")
     except ValueError:
         pass
 
@@ -94,6 +107,7 @@ class ChipDipScraper:
         self.solver = TwoCaptcha(API_KEY)
         self._rotate_every = 1  # менять прокси каждые N страниц категории
         self._autosave_file = None  # путь к файлу автосохранения текущей сессии
+        self._using_own_ip = False  # True когда активен слот "свой IP"
 
     def create_directories(self):
         directories = [
@@ -141,16 +155,28 @@ class ChipDipScraper:
 
         if PROXY_LIST:
             p = _next_proxy()
-            if p:
+            if p is None:
+                # Слот "свой IP" — работаем без прокси
+                self._current_proxy = None
+                self._using_own_ip = True
+                logger.info("Используем свой IP (без прокси)")
+            elif p["user"] is not None:
+                # Прокси с авторизацией — нужно расширение
                 self._current_proxy = p
+                self._using_own_ip = False
                 ext = self._create_proxy_extension(p["host"], p["port"], p["user"], p["pass"])
                 options.add_argument(f"--load-extension={ext}")
-                logger.info(f"Прокси: {p['host']}:{p['port']} (осталось {len(PROXY_LIST)})")
+                logger.info(f"Прокси с авторизацией: {p['host']}:{p['port']} (осталось {len(PROXY_LIST)})")
             else:
-                self._current_proxy = None
-                logger.warning("Все прокси исчерпаны, работаем без прокси")
+                # Прокси без авторизации — достаточно --proxy-server
+                self._current_proxy = p
+                self._using_own_ip = False
+                options.add_argument(f"--proxy-server=http://{p['host']}:{p['port']}")
+                logger.info(f"Прокси без авторизации: {p['host']}:{p['port']} (осталось {len(PROXY_LIST)})")
         else:
             self._current_proxy = None
+            self._using_own_ip = False
+            logger.info("Список прокси пуст, работаем без прокси")
 
         driver = webdriver.Edge(options=options)
         driver.set_page_load_timeout(30)
@@ -230,7 +256,7 @@ class ChipDipScraper:
         except:
             return False
 
-    def wait_for_browser_check(self, driver, timeout=15):
+    def wait_for_browser_check(self, driver, timeout=30):
         """Ждёт прохождения проверки браузера. True — прошло, False — не прошло."""
         logger.info("Проверка браузера (Cloudflare), ждём до %d сек...", timeout)
         for tick in range(timeout):
@@ -252,6 +278,10 @@ class ChipDipScraper:
         # Удаляем забаненный прокси
         if self._current_proxy:
             _remove_proxy(self._current_proxy)
+        elif self._using_own_ip:
+            # Слот "свой IP" тоже банят — удаляем None из пула
+            _remove_proxy(None)
+            self._using_own_ip = False
 
         if not PROXY_LIST:
             logger.error("Все прокси забанены!")
@@ -1204,7 +1234,7 @@ class ChipDipScraper:
 
                 # Проверка браузера (Cloudflare) — ждём, если не прошло — меняем прокси
                 if self.is_browser_check(driver):
-                    if not self.wait_for_browser_check(driver, timeout=15):
+                    if not self.wait_for_browser_check(driver, timeout=30):
                         if PROXY_LIST:
                             driver = self.switch_proxy(driver)
                             try:
@@ -1226,7 +1256,7 @@ class ChipDipScraper:
                         continue
                     time.sleep(3)
                     if self.is_browser_check(driver):
-                        if not self.wait_for_browser_check(driver, timeout=15):
+                        if not self.wait_for_browser_check(driver, timeout=30):
                             continue
 
                 # Проверяем капчу сразу после загрузки страницы категории
@@ -1443,7 +1473,12 @@ class ChipDipScraper:
             if PROXY_LIST:
                 print(f"\n=== Оставшиеся рабочие прокси ({len(PROXY_LIST)}) ===")
                 for p in PROXY_LIST:
-                    print(f"  {p['host']}:{p['port']}:{p['user']}:{p['pass']}")
+                    if p is None:
+                        print(f"  [свой IP]")
+                    elif p['user']:
+                        print(f"  {p['host']}:{p['port']}:{p['user']}:{p['pass']}")
+                    else:
+                        print(f"  {p['host']}:{p['port']}")
                 print("=== Конец списка ===\n")
             else:
                 print("\n⚠ Все прокси были забанены!\n")
