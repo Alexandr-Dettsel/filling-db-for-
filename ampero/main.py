@@ -8,12 +8,19 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 import time
 import json
 import os
+import zipfile
+import tempfile
+import base64
+import struct
 from dataclasses import dataclass
 import logging
-import argparse
 import re
+import itertools
 from twocaptcha import TwoCaptcha
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.getLogger('selenium').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
@@ -26,7 +33,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://ampero.ru"
-API_KEY = "---"
+API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "---")
+
+
+def _parse_proxies():
+    raw = os.getenv("PROXIES", "")
+    proxies = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        if len(parts) == 4:
+            proxies.append({"host": parts[0], "port": parts[1], "user": parts[2], "pass": parts[3]})
+    return proxies
+
+
+PROXY_LIST = _parse_proxies()
+_proxy_cycle = itertools.cycle(PROXY_LIST) if PROXY_LIST else None
 
 
 @dataclass
@@ -53,16 +77,89 @@ class AmperoScraper:
         for directory in directories:
             os.makedirs(directory, exist_ok=True)
 
+    def _create_proxy_extension(self, host, port, username, password):
+        """Создает расширение Chrome/Edge для прокси с аутентификацией"""
+        manifest_json = """
+        {
+            "version": "1.0.0",
+            "manifest_version": 2,
+            "name": "Chrome Proxy",
+            "permissions": [
+                "proxy",
+                "tabs",
+                "unlimitedStorage",
+                "storage",
+                "<all_urls>",
+                "webRequest",
+                "webRequestBlocking"
+            ],
+            "background": {
+                "scripts": ["background.js"]
+            },
+            "minimum_chrome_version":"22.0.0"
+        }
+        """
+        
+        background_js = """
+        var config = {
+            mode: "fixed_servers",
+            rules: {
+                singleProxy: {
+                    scheme: "http",
+                    host: "%s",
+                    port: parseInt(%s)
+                },
+                bypassList: ["localhost"]
+            }
+        };
+        
+        chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+        
+        function callbackFn(details) {
+            return {
+                authCredentials: {
+                    username: "%s",
+                    password: "%s"
+                }
+            };
+        }
+        
+        chrome.webRequest.onAuthRequired.addListener(
+            callbackFn,
+            {urls: ["<all_urls>"]},
+            ['blocking']
+        );
+        """ % (host, port, username, password)
+        
+        # Создаем временную директорию для расширения
+        extension_dir = tempfile.mkdtemp()
+        
+        # Создаем файлы расширения
+        with open(os.path.join(extension_dir, "manifest.json"), "w") as f:
+            f.write(manifest_json)
+        
+        with open(os.path.join(extension_dir, "background.js"), "w") as f:
+            f.write(background_js)
+        
+        return extension_dir
+
     def setup_driver(self):
         options = Options()
         options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--disable-extensions")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--log-level=3")
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
+        
+        if PROXY_LIST:
+            p = next(_proxy_cycle)
+            proxy_extension = self._create_proxy_extension(p["host"], p["port"], p["user"], p["pass"])
+            options.add_argument(f"--load-extension={proxy_extension}")
+            logger.info(f"Прокси: {p['host']}:{p['port']}")
+        else:
+            logger.warning("Прокси не настроены")
 
         driver = webdriver.Edge(options=options)
         driver.maximize_window()
@@ -224,28 +321,34 @@ class AmperoScraper:
 
             img_element = driver.find_element(By.CSS_SELECTOR, "div.AdvancedCaptcha-ImageWrapper img")
 
-            img_width = img_element.size['width']
-            img_height = img_element.size['height']
+            # Логические CSS пиксели (в них работает move_to_element_with_offset)
+            sel_w = img_element.size['width']
+            sel_h = img_element.size['height']
 
-            original_width = driver.execute_script("return arguments[0].naturalWidth;", img_element)
-            original_height = driver.execute_script("return arguments[0].naturalHeight;", img_element)
+            # screenshot_as_base64 делает скриншот в физических пикселях (sel * dpr).
+            # 2captcha получила картинку этого размера и дала координаты для неё.
+            # Читаем реальный размер PNG из заголовка IHDR и масштабируем координаты обратно.
+            png_bytes = base64.b64decode(img_element.screenshot_as_base64)
+            screenshot_w = struct.unpack('>I', png_bytes[16:20])[0]
+            screenshot_h = struct.unpack('>I', png_bytes[20:24])[0]
 
-            scale_x = img_width / original_width
-            scale_y = img_height / original_height
-            action = ActionChains(driver)
+            coord_scale_x = sel_w / screenshot_w if screenshot_w else 1
+            coord_scale_y = sel_h / screenshot_h if screenshot_h else 1
+
+            logger.info(f"Img CSS={sel_w}x{sel_h}  screenshot={screenshot_w}x{screenshot_h}  scale={coord_scale_x:.3f}x{coord_scale_y:.3f}")
 
             for i, coord in enumerate(coordinates, 1):
-                scaled_x = int(coord['x'] * scale_x)
-                scaled_y = int(coord['y'] * scale_y)
+                click_x = coord['x'] * coord_scale_x
+                click_y = coord['y'] * coord_scale_y
+                offset_x = int(click_x - sel_w / 2)
+                offset_y = int(click_y - sel_h / 2)
 
-                offset_x = scaled_x - (img_width // 2)
-                offset_y = scaled_y - (img_height // 2)
+                logger.info(f"Клик {i}: orig=({coord['x']},{coord['y']}) -> offset=({offset_x},{offset_y})")
 
-                action.move_to_element_with_offset(
-                    img_element,
-                    offset_x,
-                    offset_y
-                ).click().perform()
+                ActionChains(driver)\
+                    .move_to_element_with_offset(img_element, offset_x, offset_y)\
+                    .click()\
+                    .perform()
                 time.sleep(0.8)
 
             driver.switch_to.default_content()

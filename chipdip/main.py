@@ -1,3 +1,7 @@
+import base64
+import struct
+from time import sleep
+
 from selenium import webdriver
 from selenium.webdriver.edge.options import Options
 from selenium.webdriver.common.by import By
@@ -8,11 +12,15 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 import time
 import json
 import os
+import tempfile
 from dataclasses import dataclass
 import logging
-import argparse
 import re
+import itertools
 from twocaptcha import TwoCaptcha
+from dotenv import load_dotenv
+
+load_dotenv()
 
 logging.getLogger('selenium').setLevel(logging.WARNING)
 logging.getLogger('urllib3').setLevel(logging.WARNING)
@@ -25,7 +33,24 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.chipdip.ru"
-API_KEY = "---"
+API_KEY = os.getenv("TWOCAPTCHA_API_KEY", "---")
+
+
+def _parse_proxies():
+    raw = os.getenv("PROXIES", "")
+    proxies = []
+    for entry in raw.split(","):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        if len(parts) == 4:
+            proxies.append({"host": parts[0], "port": parts[1], "user": parts[2], "pass": parts[3]})
+    return proxies
+
+
+PROXY_LIST = _parse_proxies()
+_proxy_cycle = itertools.cycle(PROXY_LIST) if PROXY_LIST else None
 
 
 @dataclass
@@ -46,16 +71,82 @@ class ChipDipScraper:
         self.components = []
         self.create_directories()
         self.solver = TwoCaptcha(API_KEY)
+        self._rotate_every = 1  # менять прокси каждые N страниц категории
 
     def create_directories(self):
         directories = ['data', 'data/results']
         for directory in directories:
             os.makedirs(directory, exist_ok=True)
 
+    def _create_proxy_extension(self, host, port, username, password):
+        """Создает расширение Chrome/Edge для прокси с аутентификацией"""
+        manifest_json = """
+        {
+            "version": "1.0.0",
+            "manifest_version": 2,
+            "name": "Chrome Proxy",
+            "permissions": [
+                "proxy",
+                "tabs",
+                "unlimitedStorage",
+                "storage",
+                "<all_urls>",
+                "webRequest",
+                "webRequestBlocking"
+            ],
+            "background": {
+                "scripts": ["background.js"]
+            },
+            "minimum_chrome_version":"22.0.0"
+        }
+        """
+        
+        background_js = """
+        var config = {
+            mode: "fixed_servers",
+            rules: {
+                singleProxy: {
+                    scheme: "http",
+                    host: "%s",
+                    port: parseInt(%s)
+                },
+                bypassList: ["localhost"]
+            }
+        };
+        
+        chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
+        
+        function callbackFn(details) {
+            return {
+                authCredentials: {
+                    username: "%s",
+                    password: "%s"
+                }
+            };
+        }
+        
+        chrome.webRequest.onAuthRequired.addListener(
+            callbackFn,
+            {urls: ["<all_urls>"]},
+            ['blocking']
+        );
+        """ % (host, port, username, password)
+        
+        # Создаем временную директорию для расширения
+        extension_dir = tempfile.mkdtemp()
+        
+        # Создаем файлы расширения
+        with open(os.path.join(extension_dir, "manifest.json"), "w") as f:
+            f.write(manifest_json)
+        
+        with open(os.path.join(extension_dir, "background.js"), "w") as f:
+            f.write(background_js)
+        
+        return extension_dir
+
     def setup_driver(self):
         options = Options()
         options.add_argument("--disable-blink-features=AutomationControlled")
-        options.add_argument("--disable-extensions")
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--log-level=3")
@@ -63,6 +154,14 @@ class ChipDipScraper:
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
         options.add_experimental_option("excludeSwitches", ["enable-automation"])
         options.add_experimental_option('useAutomationExtension', False)
+        
+        if PROXY_LIST:
+            p = next(_proxy_cycle)
+            proxy_extension = self._create_proxy_extension(p["host"], p["port"], p["user"], p["pass"])
+            options.add_argument(f"--load-extension={proxy_extension}")
+            logger.info(f"Прокси: {p['host']}:{p['port']}")
+        else:
+            logger.warning("Прокси не настроены")
 
         driver = webdriver.Edge(options=options)
         driver.maximize_window()
@@ -81,11 +180,10 @@ class ChipDipScraper:
     def is_captcha_page(self, driver):
         try:
             captcha_indicators = [
-                "captcha",
-                "recaptcha",
+                "smartcaptcha",
                 "подтвердите, что вы не робот",
                 "проверка безопасности",
-                "security check"
+                "я не робот",
             ]
 
             page_text = driver.page_source.lower()
@@ -94,16 +192,23 @@ class ChipDipScraper:
                     return True
 
             captcha_selectors = [
+                "div#checkbox",  # Простая капча Яндекса
+                "div#advanced",  # Сложная капча Яндекса
                 "iframe[src*='recaptcha']",
                 "iframe[data-testid='checkbox-iframe']",
                 "iframe[data-testid='advanced-iframe']",
                 "div[class*='captcha']",
                 "div.g-recaptcha",
-                "div.recaptcha"
+                "div.recaptcha",
+                "div.CheckboxCaptcha",
+                "div.AdvancedCaptcha",
+                "div.Modal_visible",  # Модальное окно капчи
             ]
 
             for selector in captcha_selectors:
-                if driver.find_elements(By.CSS_SELECTOR, selector):
+                elements = driver.find_elements(By.CSS_SELECTOR, selector)
+                if elements:
+                    logger.debug(f"Найдена капча по селектору: {selector}")
                     return True
 
             return False
@@ -112,28 +217,36 @@ class ChipDipScraper:
 
     def solver_simple_captcha(self, driver):
         try:
-            iframe = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[data-testid='checkbox-iframe']"))
-            )
-            driver.switch_to.frame(iframe)
-            time.sleep(1)
-            checkbox = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.ID, "js-button"))
-            )
-            driver.execute_script("""
-                var event = new MouseEvent('click', {
-                    view: window,
-                    bubbles: true,
-                    cancelable: true
-                });
-                arguments[0].dispatchEvent(event);
-            """, checkbox)
-            driver.switch_to.default_content()
-            logger.info('checkbox отмечен')
+            time.sleep(2)
+
+            checkbox = None
+            try:
+                checkbox = WebDriverWait(driver, 10).until(
+                    EC.presence_of_element_located((By.ID, "js-button"))
+                )
+                logger.info("Найдена кнопка по ID js-button")
+            except TimeoutException:
+                try:
+                    checkbox = WebDriverWait(driver, 5).until(
+                        EC.presence_of_element_located((By.CSS_SELECTOR, "input.CheckboxCaptcha-Button"))
+                    )
+                    logger.info("Найдена кнопка по CSS селектору")
+                except TimeoutException:
+                    logger.warning("Кнопка капчи не найдена")
+                    return False
+
+            # Сначала пробуем ActionChains (человекоподобный клик)
+            try:
+                ActionChains(driver).move_to_element(checkbox).click().perform()
+            except Exception:
+                # Fallback на JS клик
+                driver.execute_script("arguments[0].click();", checkbox)
+
+            time.sleep(3)
+            logger.info('Простая капча — клик выполнен')
             return True
         except Exception as e:
             logger.warning(f"Ошибка решения простой капчи: {e}")
-            driver.switch_to.default_content()
             return False
 
     def get_sitekey_from_iframe(self, driver):
@@ -157,23 +270,26 @@ class ChipDipScraper:
 
     def get_captcha_images(self, driver):
         try:
-            iframe = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "iframe[data-testid='advanced-iframe']"))
-            )
-            driver.switch_to.frame(iframe)
+            # Новая структура - изображения находятся в модальном окне, не в iframe
+            time.sleep(2)  # Даем время на загрузку React компонентов
 
-            canvas_element = driver.find_element(By.CSS_SELECTOR, "div.AdvancedCaptcha-CanvasContainer canvas")
-            instruction_image = canvas_element.screenshot_as_base64
-
-            img_element = WebDriverWait(driver, 10).until(
-                EC.presence_of_element_located((By.CSS_SELECTOR, "div.AdvancedCaptcha-ImageWrapper img"))
+            # Ищем контейнер с изображением
+            main_img_element = WebDriverWait(driver, 10).until(
+                EC.presence_of_element_located((By.CSS_SELECTOR, "img[alt='Задание с картинкой']"))
             )
-            main_image = img_element.screenshot_as_base64
+            main_image = main_img_element.screenshot_as_base64
+
+            # Ищем изображение с инструкциями (может быть second image)
+            try:
+                instruction_img_element = driver.find_element(By.CSS_SELECTOR, "img.TaskImage")
+                instruction_image = instruction_img_element.screenshot_as_base64
+            except:
+                # Если нет отдельного изображения инструкции, используем основное
+                instruction_image = main_image
 
             driver.switch_to.default_content()
-
             logger.info("Получены изображения капчи")
-            return main_image, instruction_image, img_element
+            return main_image, instruction_image, main_img_element
 
         except Exception as e:
             logger.warning(f"Ошибка получения изображений: {e}")
@@ -182,6 +298,7 @@ class ChipDipScraper:
 
     def solver_difficult_captcha(self, driver):
         try:
+            time.sleep(2)  # Даем время на загрузку модального окна
             main_img, instruction_img, img_element = self.get_captcha_images(driver)
 
             if not main_img or not instruction_img:
@@ -196,25 +313,28 @@ class ChipDipScraper:
             )
 
             coordinates = self.parse_coordinates(result['code'])
-            self.click_silhouettes(driver, coordinates)
+            self.click_silhouettes(driver, coordinates, is_modal=True)
 
             time.sleep(1)
 
-            iframe = driver.find_element(By.CSS_SELECTOR, "iframe[data-testid='advanced-iframe']")
-            driver.switch_to.frame(iframe)
+            # Ищем кнопку отправки в новой структуре (modal)
+            try:
+                submit_btn = WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-testid='submit']"))
+                )
+                submit_btn.click()
+                logger.info("Submit нажат")
+            except TimeoutException:
+                logger.warning("Кнопка submit не найдена, пытаюсь альтернативный способ")
+                driver.execute_script("""
+                    var btn = document.querySelector('button[data-testid="submit"]');
+                    if (btn) btn.click();
+                """)
 
-            submit_btn = WebDriverWait(driver, 10).until(
-                EC.element_to_be_clickable((By.CSS_SELECTOR, "button[data-testid='submit']"))
-            )
-            submit_btn.click()
-            logger.info("Submit нажат")
-
-            driver.switch_to.default_content()
             time.sleep(1)
             return True
         except Exception as e:
             logger.error(f"Ошибка решения сложной капчи: {e}")
-            driver.switch_to.default_content()
             return False
 
     def parse_coordinates(self, coords_string):
@@ -232,45 +352,69 @@ class ChipDipScraper:
 
         return coordinates
 
-    def click_silhouettes(self, driver, coordinates):
+    def click_silhouettes(self, driver, coordinates, is_modal=False):
         try:
-            iframe = driver.find_element(By.CSS_SELECTOR, "iframe[data-testid='advanced-iframe']")
-            driver.switch_to.frame(iframe)
+            if is_modal:
+                img_element = driver.find_element(By.CSS_SELECTOR, "div.AdvancedCaptcha-ImageWrapper img")
+            else:
+                iframe = driver.find_element(By.CSS_SELECTOR, "iframe[data-testid='advanced-iframe']")
+                driver.switch_to.frame(iframe)
+                img_element = driver.find_element(By.CSS_SELECTOR, "div.AdvancedCaptcha-ImageWrapper img")
 
-            img_element = driver.find_element(By.CSS_SELECTOR, "div.AdvancedCaptcha-ImageWrapper img")
+            # Логические CSS пиксели (в них работает move_to_element_with_offset)
+            sel_w = img_element.size['width']
+            sel_h = img_element.size['height']
 
-            img_width = img_element.size['width']
-            img_height = img_element.size['height']
+            # screenshot_as_base64 делает скриншот в физических пикселях (sel * dpr).
+            # 2captcha получила картинку этого размера и дала координаты для неё.
+            # Читаем реальный размер PNG из заголовка IHDR и масштабируем координаты обратно.
+            png_bytes = base64.b64decode(img_element.screenshot_as_base64)
+            screenshot_w = struct.unpack('>I', png_bytes[16:20])[0]
+            screenshot_h = struct.unpack('>I', png_bytes[20:24])[0]
 
-            original_width = driver.execute_script("return arguments[0].naturalWidth;", img_element)
-            original_height = driver.execute_script("return arguments[0].naturalHeight;", img_element)
+            coord_scale_x = sel_w / screenshot_w if screenshot_w else 1
+            coord_scale_y = sel_h / screenshot_h if screenshot_h else 1
 
-            scale_x = img_width / original_width
-            scale_y = img_height / original_height
-            action = ActionChains(driver)
+            logger.info(f"Img CSS={sel_w}x{sel_h}  screenshot={screenshot_w}x{screenshot_h}  scale={coord_scale_x:.3f}x{coord_scale_y:.3f}")
 
             for i, coord in enumerate(coordinates, 1):
-                scaled_x = int(coord['x'] * scale_x)
-                scaled_y = int(coord['y'] * scale_y)
+                click_x = coord['x'] * coord_scale_x
+                click_y = coord['y'] * coord_scale_y
+                offset_x = int(click_x - sel_w / 2)
+                offset_y = int(click_y - sel_h / 2)
 
-                offset_x = scaled_x - (img_width // 2)
-                offset_y = scaled_y - (img_height // 2)
+                logger.info(f"Клик {i}: orig=({coord['x']},{coord['y']}) -> offset=({offset_x},{offset_y})")
 
-                action.move_to_element_with_offset(
-                    img_element,
-                    offset_x,
-                    offset_y
-                ).click().perform()
+                ActionChains(driver)\
+                    .move_to_element_with_offset(img_element, offset_x, offset_y)\
+                    .click()\
+                    .perform()
                 time.sleep(0.8)
 
-            driver.switch_to.default_content()
+            if not is_modal:
+                driver.switch_to.default_content()
             logger.info("✓ Все клики выполнены")
             return True
 
         except Exception as e:
             logger.error(f"Ошибка кликов: {e}")
-            driver.switch_to.default_content()
+            if not is_modal:
+                driver.switch_to.default_content()
             return False
+
+    def get_captcha_type(self, driver):
+        """Определяет тип капчи: 'simple', 'difficult' или None"""
+        try:
+            page_source = driver.page_source
+            # Сложная капча — модальное окно с картинками
+            if 'AdvancedCaptcha' in page_source or 'div id="advanced"' in page_source or 'id="advanced"' in page_source:
+                return 'difficult'
+            # Простая капча — чекбокс
+            if 'CheckboxCaptcha' in page_source or 'div id="checkbox"' in page_source or 'id="checkbox"' in page_source:
+                return 'simple'
+        except:
+            pass
+        return None
 
     def handle_captcha(self, driver, url):
         logger.info("Обнаружена капча, начинаем автоматическое решение...")
@@ -279,18 +423,36 @@ class ChipDipScraper:
         for attempt in range(max_attempts):
             logger.info(f"Попытка решения капчи {attempt + 1}/{max_attempts}")
 
-            # Решение простой капчи
-            if self.solver_simple_captcha(driver):
+            captcha_type = self.get_captcha_type(driver)
+            logger.info(f"Тип капчи: {captcha_type}")
+
+            solved = False
+            if captcha_type == 'simple':
+                solved = self.solver_simple_captcha(driver)
+            elif captcha_type == 'difficult':
+                solved = self.solver_difficult_captcha(driver)
+            else:
+                # Тип неизвестен — пробуем сначала простую, потом сложную
+                solved = self.solver_simple_captcha(driver)
+                if not solved:
+                    solved = self.solver_difficult_captcha(driver)
+
+            if solved:
                 time.sleep(3)
                 if not self.is_captcha_page(driver):
-                    logger.info("Простая капча успешно решена")
+                    logger.info(f"Капча ({captcha_type}) успешно решена")
                     return True
-            # Решение сложной капчи
-            if self.solver_difficult_captcha(driver):
-                time.sleep(3)
-                if not self.is_captcha_page(driver):
-                    logger.info("Сложная капча успешно решена")
-                    return True
+                else:
+                    # Возможно, появилась сложная капча после простой
+                    new_type = self.get_captcha_type(driver)
+                    logger.info(f"Капча ещё присутствует, новый тип: {new_type}")
+                    if new_type == 'difficult' and captcha_type == 'simple':
+                        logger.info("Появилась сложная капча после чекбокса, решаем...")
+                        if self.solver_difficult_captcha(driver):
+                            time.sleep(3)
+                            if not self.is_captcha_page(driver):
+                                logger.info("Сложная капча после чекбокса решена")
+                                return True
 
             logger.warning(f"Попытка {attempt + 1} не удалась")
             time.sleep(2)
@@ -744,6 +906,15 @@ class ChipDipScraper:
         category_components = []
 
         for page_num in range(start_page, end_page + 1):
+            # Ротация прокси каждые _rotate_every страниц
+            if PROXY_LIST and page_num != start_page and (page_num - start_page) % self._rotate_every == 0:
+                logger.info(f"Ротация прокси (каждые {self._rotate_every} стр.)...")
+                try:
+                    driver.quit()
+                except Exception:
+                    pass
+                driver = self.setup_driver()
+
             if page_num == 1:
                 page_url = self.add_max_items_param(category_url)
             else:
@@ -801,7 +972,7 @@ class ChipDipScraper:
                 continue
 
         logger.info(f"Категория завершена: {len(category_components)} товаров со страниц {start_page}-{end_page}")
-        return category_components
+        return category_components, driver
 
     def save_results(self, components, filename):
         if not components:
@@ -849,7 +1020,7 @@ class ChipDipScraper:
             if start_page is None or end_page is None:
                 return
 
-            components = self.parse_category_page_range(driver, category_url, category_name, start_page, end_page)
+            components, driver = self.parse_category_page_range(driver, category_url, category_name, start_page, end_page)
 
             safe_category_name = "".join(c for c in category_name if c.isalnum() or c in (' ', '_', '-')).rstrip()
             safe_category_name = safe_category_name.replace(' ', '_')
@@ -865,8 +1036,6 @@ class ChipDipScraper:
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='ChipDip Scraper')
-    args = parser.parse_args()
 
     scraper = ChipDipScraper()
     scraper.run()
