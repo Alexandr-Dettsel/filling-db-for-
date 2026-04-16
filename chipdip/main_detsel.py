@@ -1,5 +1,5 @@
 from selenium import webdriver
-from selenium.webdriver.edge.options import Options
+from selenium.webdriver.chrome.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -17,6 +17,8 @@ import logging
 import re
 from twocaptcha import TwoCaptcha
 from dotenv import load_dotenv
+import msvcrt
+import sys
 
 load_dotenv()
 
@@ -86,6 +88,14 @@ def _remove_proxy(proxy):
         pass
 
 
+def check_keypress():
+    """Проверяет была ли нажата клавиша Enter"""
+    if msvcrt.kbhit():
+        if msvcrt.getch() == b'\r':
+            return True
+    return False
+
+
 @dataclass
 class ElectronicComponent:
     name: str
@@ -142,11 +152,12 @@ class ChipDipScraper:
         options.add_argument("--disable-webrtc")
         options.add_argument("--webrtc-ip-handling-policy=disable_non_proxied_udp")
         options.add_argument("--enforce-webrtc-ip-permission-check")
+        options.add_argument("--window-size=1920,1080")
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
         user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
         ]
         options.add_argument(f"--user-agent={random.choice(user_agents)}")
 
@@ -178,9 +189,8 @@ class ChipDipScraper:
             self._using_own_ip = False
             logger.info("Список прокси пуст, работаем без прокси")
 
-        driver = webdriver.Edge(options=options)
+        driver = webdriver.Chrome(options=options)
         driver.set_page_load_timeout(30)
-        driver.maximize_window()
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         return driver
 
@@ -261,6 +271,31 @@ class ChipDipScraper:
         logger.info("Проверка браузера (Cloudflare), ждём до %d сек...", timeout)
         for tick in range(timeout):
             time.sleep(1)
+            
+            try:
+                iframes = driver.find_elements(By.TAG_NAME, "iframe")
+                for iframe in iframes:
+                    try:
+                        driver.switch_to.frame(iframe)
+                        checkboxes = driver.find_elements(By.CSS_SELECTOR, "#checkbox, .checkbox, #captcha-checkbox, [type='checkbox']")
+                        if checkboxes:
+                            checkbox = checkboxes[0]
+                            try:
+                                ActionChains(driver).move_to_element(checkbox).click().perform()
+                                logger.info("Кликнули по чекбоксу в iframe")
+                                time.sleep(3)
+                            except:
+                                pass
+                    except:
+                        pass
+                    finally:
+                        driver.switch_to.default_content()
+            except:
+                try:
+                    driver.switch_to.default_content()
+                except:
+                    pass
+
             if not self.is_browser_check(driver):
                 logger.info("✓ Проверка браузера пройдена за %d сек", tick + 1)
                 return True
@@ -448,6 +483,10 @@ class ChipDipScraper:
         last_captcha_id = None
 
         for inner_attempt in range(3):
+            if check_keypress():
+                logger.info("! Ручной пропуск капчи (нажат Enter) !")
+                return True
+
             try:
                 if inner_attempt > 0:
                     logger.info(f"Внутренняя попытка {inner_attempt + 1}/3 сложной капчи")
@@ -475,6 +514,11 @@ class ChipDipScraper:
                     file=f"data:image/png;base64,{main_img}",
                     hintImg=f"data:image/png;base64,{instruction_img}"
                 )
+                
+                if check_keypress():
+                    logger.info("! Ручной пропуск капчи (нажат Enter) !")
+                    return True
+                    
                 last_captcha_id = result.get('captchaId') or result.get('id')
                 coordinates = self.parse_coordinates(result['code'])
                 logger.info(f"2captcha ответил: {result['code']} (id={last_captcha_id})")
@@ -504,7 +548,12 @@ class ChipDipScraper:
                     )
 
                 # Ждём 5 сек — появится либо ошибка ("Попробуйте ещё раз") либо закроется overlay
-                time.sleep(5)
+                for _ in range(5):
+                    if check_keypress():
+                        logger.info("! Ручной пропуск капчи (нажат Enter) !")
+                        return True
+                    time.sleep(1)
+                    
                 driver.switch_to.default_content()
 
                 # Проверяем — закрылся ли overlay (капча пройдена)
@@ -519,6 +568,13 @@ class ChipDipScraper:
                         except:
                             pass
                     return True
+                    
+                try:
+                    if "страница не найдена" in driver.title.lower() or "страница не найдена" in driver.page_source.lower():
+                        logger.info("Появилась 'Страница не найдена' — считаем пройденным/пропущенным")
+                        return True
+                except:
+                    pass
 
                 # Overlay ещё есть — решение неверное, пробуем снова
                 logger.warning(f"Overlay ещё виден после попытки {inner_attempt + 1} — решение неверное")
@@ -543,6 +599,10 @@ class ChipDipScraper:
         """Ждёт редиректа с captcha-страницы. Возвращает True если произошёл."""
         logger.info(f"Ждём редиректа до {timeout} сек...")
         for tick in range(timeout):
+            if check_keypress():
+                logger.info("! Ручной пропуск ожидания (нажат Enter) !")
+                return True
+                
             time.sleep(1)
             if 'captcha' not in driver.current_url.lower():
                 logger.info(f"✓ Редирект на: {driver.current_url}")
@@ -558,7 +618,18 @@ class ChipDipScraper:
 
         max_attempts = 2  # solver_difficult_captcha сам делает 3 попытки внутри
         for attempt in range(max_attempts):
+            if check_keypress():
+                logger.info("! Ручной пропуск капчи (нажат Enter) !")
+                return True
+                
             logger.info(f"--- Попытка {attempt + 1}/{max_attempts} ---")
+            
+            try:
+                if "страница не найдена" in driver.title.lower() or "страница не найдена" in driver.page_source.lower():
+                    logger.info("Сразу найдено 'Страница не найдена' — пропускаем")
+                    return True
+            except:
+                pass
 
             captcha_type = self.get_captcha_type(driver)
             logger.info(f"Определён тип капчи: {captcha_type}")
@@ -573,6 +644,10 @@ class ChipDipScraper:
                 logger.info("Чекбокс нажат. Ждём до 20 сек — редирект или сложная капча...")
                 advanced_found = False
                 for tick in range(20):
+                    if check_keypress():
+                        logger.info("! Ручной пропуск капчи (нажат Enter) !")
+                        return True
+                        
                     time.sleep(1)
                     if 'captcha' not in driver.current_url.lower():
                         logger.info(f"✓ Простая капча пройдена! URL: {driver.current_url}")
@@ -1071,7 +1146,7 @@ class ChipDipScraper:
 
             # Метод 3: Поиск в таблице характеристик
             try:
-                # Получаем все строки таблицы
+                # Получаем все строки
                 rows = driver.find_elements(By.CSS_SELECTOR, ".product__param-row")
                 for row in rows:
                     try:
