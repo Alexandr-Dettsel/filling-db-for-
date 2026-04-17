@@ -1,5 +1,5 @@
 from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.edge.options import Options
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
@@ -17,7 +17,11 @@ import logging
 import re
 from twocaptcha import TwoCaptcha
 from dotenv import load_dotenv
-import msvcrt
+try:
+    import msvcrt
+except ImportError:
+    import select
+
 import sys
 
 load_dotenv()
@@ -90,9 +94,16 @@ def _remove_proxy(proxy):
 
 def check_keypress():
     """Проверяет была ли нажата клавиша Enter"""
-    if msvcrt.kbhit():
-        if msvcrt.getch() == b'\r':
-            return True
+    if 'msvcrt' in sys.modules:
+        if sys.modules['msvcrt'].kbhit():
+            if sys.modules['msvcrt'].getch() == b'\r':
+                return True
+    elif 'select' in sys.modules:
+        dr, dw, de = select.select([sys.stdin], [], [], 0)
+        if dr:
+            char = sys.stdin.read(1)
+            if char == '\n':
+                return True
     return False
 
 
@@ -156,8 +167,8 @@ class ChipDipScraper:
         options.add_experimental_option('excludeSwitches', ['enable-logging'])
 
         user_agents = [
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36 Edg/147.0.0.0",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36 Edg/146.0.0.0"
         ]
         options.add_argument(f"--user-agent={random.choice(user_agents)}")
 
@@ -189,7 +200,7 @@ class ChipDipScraper:
             self._using_own_ip = False
             logger.info("Список прокси пуст, работаем без прокси")
 
-        driver = webdriver.Chrome(options=options)
+        driver = webdriver.Edge(options=options)
         driver.set_page_load_timeout(30)
         driver.execute_script("Object.defineProperty(navigator, 'webdriver', {get: () => undefined})")
         return driver
@@ -333,23 +344,27 @@ class ChipDipScraper:
     def get_captcha_type(self, driver):
         """Определяет тип капчи по наличию iframe"""
         try:
-            # Сложная капча — появляется в div.SmartCaptcha-Overlay после клика по чекбоксу
-            # Ищем везде на странице, не только в captcha-w
-            if driver.find_elements(By.CSS_SELECTOR,
-                    "div.SmartCaptcha-Overlay iframe[data-testid='advanced-iframe'], "
-                    "iframe[data-testid='advanced-iframe']"):
+            # Делаем проверку видимости элемента (чтобы не реагировать на скрытые iframe)
+            advanced_frames = driver.find_elements(By.CSS_SELECTOR,
+                "div.SmartCaptcha-Overlay iframe[data-testid='advanced-iframe'], "
+                "iframe[data-testid='advanced-iframe']")
+            if any(frame.is_displayed() for frame in advanced_frames):
                 return 'difficult'
-            # Простая капча — checkbox-iframe внутри captcha-container
-            if driver.find_elements(By.CSS_SELECTOR, "iframe[data-testid='checkbox-iframe']"):
+
+            simple_frames = driver.find_elements(By.CSS_SELECTOR, "iframe[data-testid='checkbox-iframe']")
+            if any(frame.is_displayed() for frame in simple_frames):
                 return 'simple'
-            # iframe ещё не появился — ждём до 5 секунд
+
+            # Если не видим сразу — ждём до 5 секунд
             for _ in range(5):
                 time.sleep(1)
-                if driver.find_elements(By.CSS_SELECTOR,
-                        "div.SmartCaptcha-Overlay iframe[data-testid='advanced-iframe'], "
-                        "iframe[data-testid='advanced-iframe']"):
+                advanced_frames = driver.find_elements(By.CSS_SELECTOR,
+                    "div.SmartCaptcha-Overlay iframe[data-testid='advanced-iframe'], "
+                    "iframe[data-testid='advanced-iframe']")
+                if any(frame.is_displayed() for frame in advanced_frames):
                     return 'difficult'
-                if driver.find_elements(By.CSS_SELECTOR, "iframe[data-testid='checkbox-iframe']"):
+                simple_frames = driver.find_elements(By.CSS_SELECTOR, "iframe[data-testid='checkbox-iframe']")
+                if any(frame.is_displayed() for frame in simple_frames):
                     return 'simple'
         except:
             pass
@@ -370,14 +385,33 @@ class ChipDipScraper:
             )
             logger.info("Найдена кнопка js-button внутри iframe")
 
-            try:
-                ActionChains(driver).move_to_element(checkbox).click().perform()
-            except Exception:
-                driver.execute_script("arguments[0].click();", checkbox)
+            # Пробуем несколько способов клика (на случай, если первый "проглотится" без эффекта)
+            success = False
+            for attempt in range(3):
+                try:
+                    if attempt == 0:
+                        # 1. ActionChains с небольшим ожиданием
+                        time.sleep(1)
+                        ActionChains(driver).move_to_element(checkbox).click().perform()
+                    elif attempt == 1:
+                        # 2. Обычный клик
+                        checkbox.click()
+                    else:
+                        # 3. JavaScript клик
+                        driver.execute_script("arguments[0].click();", checkbox)
+                    success = True
+                    break
+                except Exception as e:
+                    logger.warning(f"Способ клика {attempt + 1} не сработал: {e}")
+                    time.sleep(1)
+
+            if not success:
+               logger.warning("Все попытки клика в checkbox неудачны. Пробуем JS напоследок.")
+               driver.execute_script("arguments[0].click();", checkbox)
 
             time.sleep(3)
             driver.switch_to.default_content()
-            logger.info("Простая капча — клик выполнен")
+            logger.info("Простая капча — клики выполнены")
             return True
         except Exception as e:
             logger.warning(f"Ошибка решения простой капчи: {e}")
