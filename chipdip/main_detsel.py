@@ -109,6 +109,18 @@ def check_keypress():
 
 @dataclass
 class ElectronicComponent:
+    """
+    Класс, представляющий базовую структуру электронного компонента, 
+    извлекаемого с сайта.
+
+    Attributes:
+        product_id (str): Уникальный идентификатор или артикул товара.
+        title (str): Название компонента.
+        manufacturer (str): Производитель компонента.
+        price_retail (float): Розничная цена компонента.
+        url (str): Ссылка на карточку товара.
+        image_url (str): Ссылка на изображение товара.
+    """
     name: str
     tu_number: str  # Номенклатурный номер ChipDip
     manufacturer: str  # Бренд (производитель)
@@ -122,7 +134,17 @@ class ElectronicComponent:
 
 
 class ChipDipScraper:
+    """
+    Главный класс для скрапинга данных с веб-сайта ChipDip.
+
+    Данный класс отвечает за управление жизненным циклом браузера,
+    ротацию прокси-серверов, обход систем защиты (DDoS-Guard, SmartCaptcha),
+    парсинг категорий и сохранение полученных данных в JSON.
+    """
     def __init__(self):
+        """
+        Инициализирует новый экземпляр ChipDipScraper.
+        """
         self.components = []
         self.create_directories()
         self.solver = TwoCaptcha(API_KEY)
@@ -154,6 +176,16 @@ class ChipDipScraper:
         return extension_dir
 
     def setup_driver(self):
+        """
+        Инициализирует и настраивает экземпляр WebDriver для браузера Edge.
+
+        Настраиваются опции User-Agent, размеры окна, а также подготавливается 
+        и подключается расширение браузера для аутентификации на прокси-сервере 
+        при наличии доступных прокси в пуле.
+
+        Returns:
+            webdriver.Edge: Сконфигурированный веб-драйвер готовый к использованию.
+        """
         options = Options()
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--no-sandbox")
@@ -278,8 +310,18 @@ class ChipDipScraper:
             return False
 
     def wait_for_browser_check(self, driver, timeout=30):
-        """Ждёт прохождения проверки браузера. True — прошло, False — не прошло."""
-        logger.info("Проверка браузера (Cloudflare), ждём до %d сек...", timeout)
+        """
+        Метод для ожидания прохождения проверки браузера и клика по чекбоксу Cloudflare/DDoS-Guard,
+        а также обработки капчи при ее появлении. Имитирует действия реального пользователя.
+
+        Args:
+            driver (webdriver.Edge): Экземпляр веб-драйвера.
+            timeout (int): Максимальное время ожидания прохождения защиты в секундах. Defaults to 30.
+
+        Returns:
+            bool: True если проверка успешно пройдена, False если истек таймаут или возникла ошибка.
+        """
+        logger.info(f"Ожидание проверки браузера ({timeout} сек)...")
         for tick in range(timeout):
             time.sleep(1)
             
