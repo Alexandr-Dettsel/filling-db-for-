@@ -1605,6 +1605,20 @@ class ChipDipScraper:
         logger.info("Starting chipdip scraper")
         if PROXY_LIST:
             logger.info(f"Загружено {len(PROXY_LIST)} прокси")
+
+        print("\n=== НАСТРОЙКА ОТЛОЖЕННОГО ЗАПУСКА ===")
+        delay_str = input("Через сколько минут запустить парсер? (введите 0 или ничего для старта - сейчас): ").strip()
+        if delay_str:
+            try:
+                delay_minutes = float(delay_str.replace(',', '.'))
+                if delay_minutes > 0:
+                    delay_seconds = delay_minutes * 60
+                    logger.info(f"Таймер запущен. Парсер начнет работу через {delay_minutes} минут.")
+                    time.sleep(delay_seconds)
+                    logger.info("Время ожидания вышло! Запускаем парсер...")
+            except ValueError:
+                logger.warning("Неверный формат времени, ожидалось число. Запуск без ожидания.")
+
         start_time = time.time()
 
         # Запрашиваем список категорий
