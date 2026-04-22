@@ -2,7 +2,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-VENV_DIR="${SCRIPT_DIR}/.venv"
+VENV_DIR="${SCRIPT_DIR}/venv"
 REQ_FILE="${SCRIPT_DIR}/requirements.txt"
 
 log() {
@@ -38,8 +38,18 @@ else
   log "Виртуальное окружение уже существует: ${VENV_DIR}"
 fi
 
-# shellcheck disable=SC1091
-source "${VENV_DIR}/bin/activate"
+if [[ -f "${VENV_DIR}/bin/activate" ]]; then
+  # Unix-like (Linux, macOS)
+  # shellcheck disable=SC1091
+  source "${VENV_DIR}/bin/activate"
+elif [[ -f "${VENV_DIR}/Scripts/activate" ]]; then
+  # Windows (Git Bash, MSYS2)
+  # shellcheck disable=SC1091
+  source "${VENV_DIR}/Scripts/activate"
+else
+  log "Ошибка: не найден скрипт активации виртуального окружения в ${VENV_DIR}!" >&2
+  exit 1
+fi
 
 log "Обновляю pip в виртуальном окружении..."
 python -m pip install --upgrade pip
@@ -47,24 +57,20 @@ python -m pip install --upgrade pip
 log "Устанавливаю зависимости из ${REQ_FILE}..."
 python -m pip install -r "${REQ_FILE}"
 
-if command -v microsoft-edge >/dev/null 2>&1 || dpkg -s microsoft-edge-stable >/dev/null 2>&1; then
+if command -v microsoft-edge >/dev/null 2>&1 || command -v microsoft-edge-stable >/dev/null 2>&1 || dpkg -s microsoft-edge-stable >/dev/null 2>&1; then
   log "Microsoft Edge уже установлен."
 else
   log "Устанавливаю Microsoft Edge..."
   ${SUDO} apt-get update
-  ${SUDO} apt-get install -y software-properties-common apt-transport-https wget gnupg
-
-  if [[ ! -f /etc/apt/trusted.gpg.d/microsoft.gpg ]]; then
-    wget -q https://packages.microsoft.com/keys/microsoft.asc -O- | ${SUDO} apt-key add -
-  fi
-
-  if ! grep -Rqs "packages.microsoft.com/repos/edge" /etc/apt/sources.list /etc/apt/sources.list.d/*.list 2>/dev/null; then
-    ${SUDO} add-apt-repository -y "deb [arch=amd64] https://packages.microsoft.com/repos/edge stable main"
-  fi
-
+  ${SUDO} apt-get install -y software-properties-common apt-transport-https wget
+  wget -q https://packages.microsoft.com/keys/microsoft.asc -O- | ${SUDO} apt-key add -
+  ${SUDO} add-apt-repository "deb [arch=amd64] https://packages.microsoft.com/repos/edge stable main"
   ${SUDO} apt-get update
   ${SUDO} apt-get install -y microsoft-edge-stable
+
   log "Microsoft Edge установлен."
 fi
 
 log "Готово. Виртуальное окружение и зависимости настроены."
+log "Для запуска скрипта используйте команду:"
+log "python3 ${SCRIPT_DIR}/chipdip/main_detsel.py"
