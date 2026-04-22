@@ -1606,6 +1606,19 @@ class ChipDipScraper:
         if PROXY_LIST:
             logger.info(f"Загружено {len(PROXY_LIST)} прокси")
 
+        # Запрашиваем список категорий
+        categories = self.get_categories_from_user()
+        if not categories:
+            logger.error("Не введено ни одной категории")
+            return
+
+        print(f"\n{'='*50}")
+        print(f"Категорий к парсингу: {len(categories)}")
+        for i, (url, name) in enumerate(categories, 1):
+            print(f"  {i}. {name} — {url}")
+        print(f"Страницы: ВСЕ (до конца)")
+        print(f"{'='*50}\n")
+
         print("\n=== НАСТРОЙКА ОТЛОЖЕННОГО ЗАПУСКА ===")
         delay_str = input("Через сколько минут запустить парсер? (введите 0 или ничего для старта - сейчас): ").strip()
         if delay_str:
@@ -1620,20 +1633,6 @@ class ChipDipScraper:
                 logger.warning("Неверный формат времени, ожидалось число. Запуск без ожидания.")
 
         start_time = time.time()
-
-        # Запрашиваем список категорий
-        categories = self.get_categories_from_user()
-        if not categories:
-            logger.error("Не введено ни одной категории")
-            return
-
-        print(f"\n{'='*50}")
-        print(f"Категорий к парсингу: {len(categories)}")
-        for i, (url, name) in enumerate(categories, 1):
-            print(f"  {i}. {name} — {url}")
-        print(f"Страницы: ВСЕ (до конца)")
-        print(f"{'='*50}\n")
-
         driver = None
 
         try:
