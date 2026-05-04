@@ -2,3 +2,5 @@ selenium
 webdriver-manager
 2captcha-python
 python-dotenv
+undetected-chromedriver
+setuptools
