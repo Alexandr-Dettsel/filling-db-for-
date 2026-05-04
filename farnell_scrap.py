@@ -214,6 +214,18 @@ def process_url(driver, url, current_path, category_name="Root"):
         print(f"[-] На странице {url} не удалось найти ни список категорий, ни таблицу товаров.")
 
 def main():
+    # Запрашиваем стартовую ссылку у пользователя при запуске
+    start_url = input("Введите стартовую ссылку на категорию Farnell: ").strip()
+    if not start_url:
+        print("Ссылка не введена. Завершение работы.")
+        return
+        
+    # Динамически определяем название главной категории из ссылки (например: passive-components)
+    if '/c/' in start_url:
+        base_cat_name = start_url.split('/c/')[-1].split('?')[0].replace('/', '_')
+    else:
+        base_cat_name = "Root_Category"
+
     options = uc.ChromeOptions()
     options.add_argument('--disable-gpu')
     options.add_argument('--window-size=1920,1080')
@@ -224,14 +236,12 @@ def main():
     driver = uc.Chrome(options=options, version_main=147)
     driver.maximize_window()
     
-    start_url = f"{BASE_URL}/c/passive-components?ICID=I-HP-PC-PASSIVE_COMPONENTS-FEB21-WF1980967"
-    
     base_folder = os.path.join(os.path.dirname(__file__), "farnell", "data")
     if not os.path.exists(base_folder):
         os.makedirs(base_folder)
         
     try:
-        process_url(driver, start_url, base_folder, "Passive Components")
+        process_url(driver, start_url, base_folder, base_cat_name)
     finally:
         driver.quit()
         print("Скрипт завершил работу.")
