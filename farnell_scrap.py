@@ -2,6 +2,7 @@ import os
 import json
 import time
 import random
+from datetime import datetime
 from urllib.parse import urljoin
 
 import undetected_chromedriver as uc
@@ -49,7 +50,7 @@ def parse_table_page(driver, category_name, save_path):
     all_products = []
     
     while True:
-        human_delay(2, 4) # Ждем загрузки элементов таблицы
+        human_delay(3, 5) # Ждем загрузки элементов таблицы
         
         # 1. Получаем заголовки таблицы, чтобы сопоставить их со значениями
         headers = driver.find_elements(By.XPATH, "//thead//th")
@@ -66,65 +67,90 @@ def parse_table_page(driver, category_name, save_path):
             '' # Пустые заголовки
         ]
         
-        rows = driver.find_elements(By.XPATH, "//tbody/tr[contains(@class, 'ProductListerTablestyles__TableRow')]")
-        
-        for row in rows:
-            product_data = {}
-            
+        # Обрабатываем строки с перехватом возможных StaleElementReferenceException
+        max_retries = 3
+        for attempt in range(max_retries):
             try:
-                # Номер по каталогу производителя (Part Number)
-                part_no = row.find_element(By.XPATH, ".//div[contains(@class, 'ManufacturerPartNoTableCellstyles__PartNumber')]").text
-                product_data['Номер по каталогу'] = part_no
-            except NoSuchElementException:
-                continue # Если нет парт-номера, пропускаем строку
+                rows = driver.find_elements(By.XPATH, "//tbody/tr[contains(@class, 'ProductListerTablestyles__TableRow')]")
+                current_page_products = []
                 
-            # Собираем остальные динамические характеристики
-            attributes = row.find_elements(By.XPATH, ".//td[contains(@class, 'extended-attribute')]")
-            
-            # Сопоставляем значения со столбцами
-            attr_index = 0
-            for h_name in header_names:
-                if h_name in excluded_headers or h_name == 'Номер по каталогу производителя':
-                    continue
+                for row in rows:
+                    product_data = {}
                     
-                if attr_index < len(attributes):
-                    val = attributes[attr_index].text.strip()
-                    product_data[h_name] = val if val != "-" else None
-                    attr_index += 1
+                    try:
+                        # Номер по каталогу производителя (Part Number)
+                        part_no = row.find_element(By.XPATH, ".//div[contains(@class, 'ManufacturerPartNoTableCellstyles__PartNumber')]").text
+                        product_data['Номер по каталогу'] = part_no
+                    except NoSuchElementException:
+                        continue # Если нет парт-номера, пропускаем строку
+                        
+                    # Собираем остальные динамические характеристики
+                    attributes = row.find_elements(By.XPATH, ".//td[contains(@class, 'extended-attribute')]")
                     
-            all_products.append(product_data)
+                    # Сопоставляем значения со столбцами
+                    attr_index = 0
+                    for h_name in header_names:
+                        if h_name in excluded_headers or h_name == 'Номер по каталогу производителя':
+                            continue
+                            
+                        if attr_index < len(attributes):
+                            val = attributes[attr_index].text.strip()
+                            product_data[h_name] = val if val != "-" else None
+                            attr_index += 1
+                            
+                    current_page_products.append(product_data)
+                
+                # Если цикл for завершился без "stale" ошибок, добавляем в общий список и прерываем попытки
+                all_products.extend(current_page_products)
+                break 
+                
+            except Exception as err:
+                print(f"    -> [Попытка {attempt+1}/{max_retries}] Ошибка при сборе строк таблиц (возможно Stale Element). Пробуем еще раз...")
+                human_delay(2, 4)
+                if attempt == max_retries - 1:
+                    print("    -> Не удалось извлечь данные со страницы после всех попыток.")
             
         # 3. Пагинация
         try:
+            # Убедимся, что ничто не перекрывает
+            handle_cookie_banner(driver)
+            
             next_btn = driver.find_element(By.XPATH, "//button[contains(@class, 'bx--pagination__button--forward')]")
             
             # Проверяем, активна ли кнопка
-            if next_btn.get_attribute("disabled") is not None or "disabled" in next_btn.get_attribute("class"):
-                print("    -> Достигнута последняя страница.")
+            if next_btn.get_attribute("disabled") is not None or "disabled" in next_btn.get_attribute("class") or next_btn.get_attribute("disabled") == "true":
+                print("    -> Достигнута последняя страница (кнопка отключена).")
                 break
                 
             # Скроллим до кнопки и кликаем
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
             human_delay(1, 2)
             
-            if rows:
-                first_row = rows[0]
+            rows_for_staleness = driver.find_elements(By.XPATH, "//tbody/tr[contains(@class, 'ProductListerTablestyles__TableRow')]")
+            if rows_for_staleness:
+                first_row = rows_for_staleness[0]
+            else:
+                first_row = None
             
             driver.execute_script("arguments[0].click();", next_btn)
-            print("    -> Переход на следующую страницу...")
+            current_time = datetime.now().strftime("%H:%M:%S")
+            print(f"    -> [{current_time}] Переход на следующую страницу...")
             
             # Ждем обновления таблицы
-            if rows:
-                WebDriverWait(driver, 10).until(
-                    EC.staleness_of(first_row)
-                )
+            if first_row:
+                try:
+                    WebDriverWait(driver, 20).until(
+                        EC.staleness_of(first_row)
+                    )
+                except TimeoutException:
+                    print("    -> [Предупреждение] Таймаут ожидания обновления до новой таблицы (но возможно она и так загрузилась).")
             else:
-                human_delay(2, 4)
+                human_delay(3, 5)
         except NoSuchElementException:
             print("    -> Кнопка 'Далее' не найдена. Конец категории.")
             break
         except Exception as e:
-            print(f"    -> Остановка пагинации. Причина: {e}")
+            print(f"    -> Остановка пагинации (переход в конец). Причина: {e}")
             break
 
     # 4. Сохраняем собранные данные в JSON
@@ -137,15 +163,23 @@ def parse_table_page(driver, category_name, save_path):
         print(f"[-] Не удалось собрать товары для категории {category_name}")
 
 def process_url(driver, url, current_path, category_name="Root"):
-    print(f"\n[>] Переход: {url}")
+    clean_cat_name = category_name.replace("/", "_").replace("\\", "_")
+    expected_file = os.path.join(current_path, f"{clean_cat_name}.json")
+    
+    if os.path.exists(expected_file):
+        print(f"\n[!] Пропускаем, так как файл уже существует: {expected_file}")
+        return
+
+    current_time = datetime.now().strftime("%H:%M:%S")
+    print(f"\n[>] [{current_time}] Переход: {url}")
     driver.get(url)
     
     # Дадим начальное время на подгрузку страницы
     time.sleep(2)
     handle_cookie_banner(driver)
     
-    print("    -> Ожидание отрисовки контента (до 20 сек)...")
-    max_wait = 20
+    print("    -> Ожидание отрисовки контента (до 30 сек)...")
+    max_wait = 30
     start_time = time.time()
     table_rows = []
     subcategories = []
@@ -187,7 +221,6 @@ def process_url(driver, url, current_path, category_name="Root"):
     
     if table_rows:
         # ПОДКАТЕГОРИЙ НЕТ, НО ЕСТЬ ТАБЛИЦА -> Значит это конечная таблица товаров
-        clean_cat_name = category_name.replace("/", "_").replace("\\", "_")
         parse_table_page(driver, clean_cat_name, current_path)
         return
 
