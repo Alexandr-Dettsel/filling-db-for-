@@ -14,9 +14,6 @@ from selenium.common.exceptions import NoSuchElementException, TimeoutException
 
 BASE_URL = "https://ru.farnell.com"
 
-def human_delay(min_s=1, max_s=3):
-    time.sleep(random.uniform(min_s, max_s))
-
 def handle_cookie_banner(driver):
     try:
         btn = driver.find_element(By.ID, "onetrust-reject-all-handler")
@@ -24,34 +21,35 @@ def handle_cookie_banner(driver):
             # Нажимаем через JS, чтобы избежать перекрытия другими элементами
             driver.execute_script("arguments[0].click();", btn)
             print("    -> Закрыли баннер с куки (Отклонили)")
-            human_delay(1, 2)
     except Exception:
         pass
 
-def parse_table_page(driver, category_name, save_path):
+def parse_table_page(driver, category_name, save_path, base_category_url):
     print(f"[*] Собираем данные из таблицы для: {category_name}")
     
-    # Изменяем количество отображаемых элементов на 50 перед началом сбора
-    try:
-        # Ищем селект по ID
-        select_elem = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.ID, "bx-pagination-select-table-pagination"))
-        )
-        select = Select(select_elem)
-        
-        # Если сейчас выбрано не 50, переключаем
-        if select.first_selected_option.get_attribute("value") != "50":
-            select.select_by_value("50")
-            print("    -> Переключили отображение на 50 товаров на страницу")
-            human_delay(3, 5) # Ждем, пока перерисуется таблица
-    except Exception as e:
-        print(f"    -> Не удалось переключить таблицy на 50 элементов (возможно, их мало в этой категории)")
-
     all_products = []
+    page_num = 1
     
     while True:
-        human_delay(3, 5) # Ждем загрузки элементов таблицы
+        current_time = datetime.now().strftime("%H:%M:%S")
+        print(f"    -> [{current_time}] Начало сбора данных со страницы {page_num}...")
         
+        # Изменяем количество отображаемых элементов на 50 перед началом сбора
+        try:
+            # Ищем селект по ID
+            select_elem = WebDriverWait(driver, 5).until(
+                EC.presence_of_element_located((By.ID, "bx-pagination-select-table-pagination"))
+            )
+            select = Select(select_elem)
+            
+            # Если сейчас выбрано не 50, переключаем
+            if select.first_selected_option.get_attribute("value") != "50":
+                select.select_by_value("50")
+                print("    -> Переключили отображение на 50 товаров на страницу")
+                time.sleep(2) # Небольшая задержка для загрузки
+        except Exception as e:
+            pass
+
         # 1. Получаем заголовки таблицы, чтобы сопоставить их со значениями
         headers = driver.find_elements(By.XPATH, "//thead//th")
         header_names = [h.text.split('\n')[0].strip() for h in headers if h.text.strip()]
@@ -100,23 +98,36 @@ def parse_table_page(driver, category_name, save_path):
                             
                     current_page_products.append(product_data)
                 
-                # Если цикл for завершился без "stale" ошибок, добавляем в общий список и прерываем попытки
-                all_products.extend(current_page_products)
+                # Если цикл for завершился без "stale" ошибок, добавляем в файл и прерываем попытки
+                file_path = os.path.join(save_path, f"{category_name}.json")
+                
+                if os.path.exists(file_path):
+                    with open(file_path, 'r', encoding='utf-8') as f:
+                        try:
+                            saved_products = json.load(f)
+                        except json.JSONDecodeError:
+                            saved_products = []
+                else:
+                    saved_products = []
+                
+                saved_products.extend(current_page_products)
+                
+                with open(file_path, 'w', encoding='utf-8') as f:
+                    json.dump(saved_products, f, ensure_ascii=False, indent=4)
+                    
+                print(f"    -> [Сохранение] Добавлено {len(current_page_products)} товаров (Всего: {len(saved_products)}) в файл")
                 break 
                 
             except Exception as err:
                 print(f"    -> [Попытка {attempt+1}/{max_retries}] Ошибка при сборе строк таблиц (возможно Stale Element). Пробуем еще раз...")
-                human_delay(2, 4)
+                time.sleep(1)
                 if attempt == max_retries - 1:
                     print("    -> Не удалось извлечь данные со страницы после всех попыток.")
             
-        # 3. Пагинация
+        # 3. Пагинация через URL
         try:
-            # Убедимся, что ничто не перекрывает
-            handle_cookie_banner(driver)
-            
-            # Добавляем WebDriverWait, так как пагинация может не успеть появиться сразу после строк
-            next_btn = WebDriverWait(driver, 15).until(
+            # Проверяем, есть ли кнопка далее и активна ли она
+            next_btn = WebDriverWait(driver, 5).until(
                 EC.presence_of_element_located((By.XPATH, "//button[contains(@class, 'bx--pagination__button--forward')]"))
             )
             
@@ -125,47 +136,22 @@ def parse_table_page(driver, category_name, save_path):
                 print("    -> Достигнута последняя страница (кнопка отключена).")
                 break
             
-            # Скроллим до кнопки и кликаем
-            # Используем JS клик, так как элемент может перекрываться другими
-            driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
-            human_delay(1, 2)
+            page_num += 1
+            next_url = f"{base_category_url}/prl/results/{page_num}"
             
-            rows_for_staleness = driver.find_elements(By.XPATH, "//tbody/tr[contains(@class, 'ProductListerTablestyles__TableRow')]")
-            if rows_for_staleness:
-                first_row = rows_for_staleness[0]
-            else:
-                first_row = None
-            
-            driver.execute_script("arguments[0].click();", next_btn)
             current_time = datetime.now().strftime("%H:%M:%S")
-            print(f"    -> [{current_time}] Переход на следующую страницу...")
+            print(f"    -> [{current_time}] Переход на страницу {page_num}: {next_url}")
             
-            # Ждем обновления таблицы
-            if first_row:
-                try:
-                    WebDriverWait(driver, 20).until(
-                        EC.staleness_of(first_row)
-                    )
-                    human_delay(1, 2) # Небольшая пауза после обновления DOM
-                except TimeoutException:
-                    print("    -> [Предупреждение] Таймаут ожидания обновления до новой таблицы (но возможно она и так загрузилась).")
-            else:
-                human_delay(3, 5)
+            driver.get(next_url)
+            time.sleep(2)
+            handle_cookie_banner(driver)
+            
         except TimeoutException:
             print("    -> Кнопка 'Далее' не найдена вовремя. Скорее всего, конец категории.")
             break
         except Exception as e:
             print(f"    -> Остановка пагинации (переход в конец). Причина: {e}")
             break
-
-    # 4. Сохраняем собранные данные в JSON
-    if all_products:
-        file_path = os.path.join(save_path, f"{category_name}.json")
-        with open(file_path, 'w', encoding='utf-8') as f:
-            json.dump(all_products, f, ensure_ascii=False, indent=4)
-        print(f"[+] Сохранено {len(all_products)} товаров в файл: {file_path}")
-    else:
-        print(f"[-] Не удалось собрать товары для категории {category_name}")
 
 def process_url(driver, url, current_path, category_name="Root"):
     clean_cat_name = category_name.replace("/", "_").replace("\\", "_")
@@ -183,8 +169,8 @@ def process_url(driver, url, current_path, category_name="Root"):
     time.sleep(2)
     handle_cookie_banner(driver)
     
-    print("    -> Ожидание отрисовки контента (до 30 сек)...")
-    max_wait = 30
+    print("    -> Ожидание отрисовки контента (до 60 сек)...")
+    max_wait = 60
     start_time = time.time()
     table_rows = []
     subcategories = []
@@ -226,7 +212,8 @@ def process_url(driver, url, current_path, category_name="Root"):
     
     if table_rows:
         # ПОДКАТЕГОРИЙ НЕТ, НО ЕСТЬ ТАБЛИЦА -> Значит это конечная таблица товаров
-        parse_table_page(driver, clean_cat_name, current_path)
+        base_category_url = url.split("?")[0].rstrip("/")
+        parse_table_page(driver, clean_cat_name, current_path, base_category_url)
         return
 
     if subcategories:
