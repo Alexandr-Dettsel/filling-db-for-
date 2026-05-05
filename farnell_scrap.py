@@ -247,17 +247,17 @@ def process_url(driver, url, current_path, category_name="Root"):
         print(f"[-] На странице {url} не удалось найти ни список категорий, ни таблицу товаров.")
 
 def main():
-    # Запрашиваем стартовую ссылку у пользователя при запуске
-    start_url = input("Введите стартовую ссылку на категорию Farnell: ").strip()
-    if not start_url:
-        print("Ссылка не введена. Завершение работы.")
-        return
+    print("Введите ссылки на категории Farnell. Для завершения ввода просто нажмите Enter на пустой строке.")
+    start_urls = []
+    while True:
+        url = input("Ссылка: ").strip()
+        if not url:
+            break
+        start_urls.append(url)
         
-    # Динамически определяем название главной категории из ссылки (например: passive-components)
-    if '/c/' in start_url:
-        base_cat_name = start_url.split('/c/')[-1].split('?')[0].replace('/', '_')
-    else:
-        base_cat_name = "Root_Category"
+    if not start_urls:
+        print("Ссылки не введены. Завершение работы.")
+        return
 
     options = uc.ChromeOptions()
     options.add_argument('--disable-gpu')
@@ -274,7 +274,14 @@ def main():
         os.makedirs(base_folder)
         
     try:
-        process_url(driver, start_url, base_folder, base_cat_name)
+        for start_url in start_urls:
+            # Динамически определяем название главной категории из ссылки
+            if '/c/' in start_url:
+                base_cat_name = start_url.split('/c/')[-1].split('?')[0].replace('/', '_')
+            else:
+                base_cat_name = "Root_Category"
+                
+            process_url(driver, start_url, base_folder, base_cat_name)
     finally:
         driver.quit()
         print("Скрипт завершил работу.")
