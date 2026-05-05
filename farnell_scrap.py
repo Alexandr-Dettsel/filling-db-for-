@@ -115,14 +115,18 @@ def parse_table_page(driver, category_name, save_path):
             # Убедимся, что ничто не перекрывает
             handle_cookie_banner(driver)
             
-            next_btn = driver.find_element(By.XPATH, "//button[contains(@class, 'bx--pagination__button--forward')]")
+            # Добавляем WebDriverWait, так как пагинация может не успеть появиться сразу после строк
+            next_btn = WebDriverWait(driver, 15).until(
+                EC.presence_of_element_located((By.XPATH, "//button[contains(@class, 'bx--pagination__button--forward')]"))
+            )
             
             # Проверяем, активна ли кнопка
             if next_btn.get_attribute("disabled") is not None or "disabled" in next_btn.get_attribute("class") or next_btn.get_attribute("disabled") == "true":
                 print("    -> Достигнута последняя страница (кнопка отключена).")
                 break
-                
+            
             # Скроллим до кнопки и кликаем
+            # Используем JS клик, так как элемент может перекрываться другими
             driver.execute_script("arguments[0].scrollIntoView({block: 'center'});", next_btn)
             human_delay(1, 2)
             
@@ -142,12 +146,13 @@ def parse_table_page(driver, category_name, save_path):
                     WebDriverWait(driver, 20).until(
                         EC.staleness_of(first_row)
                     )
+                    human_delay(1, 2) # Небольшая пауза после обновления DOM
                 except TimeoutException:
                     print("    -> [Предупреждение] Таймаут ожидания обновления до новой таблицы (но возможно она и так загрузилась).")
             else:
                 human_delay(3, 5)
-        except NoSuchElementException:
-            print("    -> Кнопка 'Далее' не найдена. Конец категории.")
+        except TimeoutException:
+            print("    -> Кнопка 'Далее' не найдена вовремя. Скорее всего, конец категории.")
             break
         except Exception as e:
             print(f"    -> Остановка пагинации (переход в конец). Причина: {e}")
