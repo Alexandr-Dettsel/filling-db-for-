@@ -4,6 +4,7 @@ import time
 import random
 from datetime import datetime
 from urllib.parse import urljoin
+import re
 
 import undetected_chromedriver as uc
 from selenium.webdriver.common.by import By
@@ -29,6 +30,7 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
     
     all_products = []
     page_num = 1
+    max_pages = 1
     
     while True:
         current_time = datetime.now().strftime("%H:%M:%S")
@@ -47,21 +49,43 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
                 if select.first_selected_option.get_attribute("value") != "50":
                     select.select_by_value("50")
                     print("    -> Переключили отображение на 50 товаров на страницу")
-                    time.sleep(1.5) # Небольшая задержка для загрузки
+                    time.sleep(2) # Небольшая задержка для загрузки и пересчета страниц
+                    
+                # Получаем общее количество страниц
+                pagination_xpath = "//span[contains(@class, 'bx--pagination__text')] | //span[@class='paginTotal'] | //div[contains(@class,'pagination')]//span[contains(text(), 'of') or contains(text(), 'из')]"
+                page_texts = driver.find_elements(By.XPATH, pagination_xpath)
+                
+                for pt in page_texts:
+                    match = re.search(r'(\d+)', pt.text.replace(' ', ''))
+                    if match:
+                        found_pages = int(match.group(1))
+                        # Если нашли число больше текущего, берем его (т.к. может быть текст "1 of 5708", берем 5708)
+                        if found_pages > max_pages:
+                            max_pages = found_pages
+                            
+                print(f"    -> Всего страниц для сбора: {max_pages}")
             except Exception as e:
-                pass
+                print(f"    -> Не удалось точно определить количество страниц. Ошибка: {e}")
             
-        # Надежное ожидание появления именно строк с товарами, так как заголовки могут появиться раньше самих данных
+        # Надежное ожидание появления именно строк с товарами
+        row_xpath = "//tr[contains(@class, 'ProductListerTablestyles__TableRow')] | //table[@id='s-results']//tr[contains(@class, 'altRow')] | //table[@id='s-results']//tbody/tr"
         try:
-            WebDriverWait(driver, 20).until(
-                lambda d: len(d.find_elements(By.XPATH, "//tbody/tr[contains(@class, 'ProductListerTablestyles__TableRow')]")) > 0
+            WebDriverWait(driver, 10).until(
+                lambda d: len(d.find_elements(By.XPATH, row_xpath)) > 0
             )
         except Exception:
             pass
 
-        # 1. Получаем заголовки таблицы, чтобы сопоставить их со значениями
-        headers = driver.find_elements(By.XPATH, "//thead//th")
-        header_names = [h.text.split('\n')[0].strip() for h in headers if h.text.strip()]
+        # 1. Получаем заголовки таблицы через JS (значительно быстрее)
+        header_names = driver.execute_script("""
+            let headers = document.evaluate("//thead//th | //th", document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+            let names = [];
+            for (let i = 0; i < headers.snapshotLength; i++) {
+                let text = headers.snapshotItem(i).innerText;
+                if(text && text.trim()) names.push(text.split('\\n')[0].trim());
+            }
+            return names;
+        """)
         
         # 2. Исключаем колонки, которые нам не нужны
         excluded_headers = [
@@ -75,42 +99,50 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
         ]
         
         # Обрабатываем строки с перехватом возможных StaleElementReferenceException
-        max_retries = 10
+        max_retries = 3
         current_page_products = []
         
         for attempt in range(max_retries):
             try:
-                rows = driver.find_elements(By.XPATH, "//tbody/tr[contains(@class, 'ProductListerTablestyles__TableRow')]")
+                # ИЗВЛЕКАЕМ ДАННЫЕ ЧЕРЕЗ JAVASCRIPT (Выполняется мгновенно в браузере, а не гоняет запросы через Selenium API)
+                js_script = """
+                let data = [];
+                let rows = document.evaluate(arguments[0], document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                for (let i = 0; i < rows.snapshotLength; i++) {
+                    let row = rows.snapshotItem(i);
+                    let partNoNode = document.evaluate(".//*[contains(@class, 'PartNumber') or contains(@class, 'mftrPart')]", row, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue;
+                    if (!partNoNode) continue;
+                    
+                    let colsNodes = document.evaluate(".//td[contains(@class, 'extended-attribute') or not(@class)]", row, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
+                    let attrs = [];
+                    for (let j = 0; j < colsNodes.snapshotLength; j++) {
+                        let text = colsNodes.snapshotItem(j).innerText;
+                        attrs.push(text ? text.trim() : "");
+                    }
+                    data.push({'part_no': partNoNode.innerText.trim(), 'attrs': attrs});
+                }
+                return data;
+                """
+                raw_data = driver.execute_script(js_script, row_xpath)
                 
                 # Если таблица пуста, возможно страница просто очень долго грузится - дадим ей еще шанс
-                if not rows and attempt < max_retries - 1:
-                    print(f"    -> [Ожидание] Товары пока не появились на странице (Попытка {attempt+1}/{max_retries}). Ждем еще 5 сек...")
-                    time.sleep(5)
+                if not raw_data and attempt < max_retries - 1:
+                    print(f"    -> [Ожидание] Товары пока не появились на странице (Попытка {attempt+1}/{max_retries}). Ждем еще 2 сек...")
+                    time.sleep(2)
                     continue
                 
                 current_page_products = []
                 
-                for row in rows:
-                    product_data = {}
+                for row_data in raw_data:
+                    product_data = {'Номер по каталогу': row_data['part_no']}
                     
-                    try:
-                        # Номер по каталогу производителя (Part Number)
-                        part_no = row.find_element(By.XPATH, ".//div[contains(@class, 'ManufacturerPartNoTableCellstyles__PartNumber')]").text
-                        product_data['Номер по каталогу'] = part_no
-                    except NoSuchElementException:
-                        continue # Если нет парт-номера, пропускаем строку
-                        
-                    # Собираем остальные динамические характеристики
-                    attributes = row.find_elements(By.XPATH, ".//td[contains(@class, 'extended-attribute')]")
-                    
-                    # Сопоставляем значения со столбцами
                     attr_index = 0
                     for h_name in header_names:
                         if h_name in excluded_headers or h_name == 'Номер по каталогу производителя':
                             continue
                             
-                        if attr_index < len(attributes):
-                            val = attributes[attr_index].text.strip()
+                        if attr_index < len(row_data['attrs']):
+                            val = row_data['attrs'][attr_index]
                             product_data[h_name] = val if val != "-" else None
                             attr_index += 1
                             
@@ -148,19 +180,21 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
             
         print(f"    -> [Сохранение] Добавлено {len(current_page_products)} товаров (Всего: {len(saved_products)}) в файл")
         
+        if page_num >= max_pages:
+            print(f"    -> Достигнута последняя страница ({max_pages}). Завершаем сбор категории.")
+            break
+            
         # 3. Пагинация через URL
         try:
             page_num += 1
             next_url = f"{base_category_url}/prl/results/{page_num}"
             
             current_time = datetime.now().strftime("%H:%M:%S")
-            print(f"    -> [{current_time}] Переход на страницу {page_num}: {next_url}")
+            print(f"    -> [{current_time}] Переход на страницу {page_num} из {max_pages}: {next_url}")
             
             driver.get(next_url)
             time.sleep(0.5)
             handle_cookie_banner(driver)
-            
-            # Проверку на 404 или отсутствие элементов мы делаем в начале следующей итерации (если current_page_products пуст)
             
         except Exception as e:
             print(f"    -> Ошибка при переходе на следующую страницу: {e}")
@@ -263,12 +297,14 @@ def main():
         print("Ссылки не введены. Завершение работы.")
         return
 
-    options = uc.ChromeOptions()
+    options = uc.ChromeOptions( )
+    options.page_load_strategy = 'none'  # Вообще не ждем загрузки (отдает управление мгновенно), ждем только наши элементы через WebDriverWait
     options.add_argument('--disable-gpu')
     options.add_argument('--window-size=1920,1080')
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
 
+    #driver = uc.Chrome(options=options, version_main=147)
     driver = uc.Chrome(options=options)
     driver.maximize_window()
     
