@@ -25,6 +25,20 @@ def handle_cookie_banner(driver):
     except Exception:
         pass
 
+def check_and_reload_if_403(driver):
+    attempts = 0
+    while attempts < 5:
+        title = driver.title if driver.title else ""
+        page_source = driver.page_source if driver.page_source else ""
+        if "Access Denied" in title or "403" in title or "Access to this page has been denied" in page_source:
+            print(f"    -> [!] Обнаружена ошибка 403 / Access Denied. Ожидание и перезагрузка ({attempts+1}/5)...")
+            time.sleep(random.uniform(4, 7))
+            driver.refresh()
+            time.sleep(3)
+            attempts += 1
+        else:
+            break
+
 def parse_table_page(driver, category_name, save_path, base_category_url):
     print(f"[*] Собираем данные из таблицы для: {category_name}")
     
@@ -69,12 +83,14 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
             
         # Надежное ожидание появления именно строк с товарами
         row_xpath = "//tr[contains(@class, 'ProductListerTablestyles__TableRow')] | //table[@id='s-results']//tr[contains(@class, 'altRow')] | //table[@id='s-results']//tbody/tr"
-        try:
-            WebDriverWait(driver, 10).until(
-                lambda d: len(d.find_elements(By.XPATH, row_xpath)) > 0
-            )
-        except Exception:
-            pass
+        
+        # Бесконечно ждем, пока товары появятся (мы точно знаем, что страница есть)
+        while True:
+            try:
+                WebDriverWait(driver, 5).until(lambda d: len(d.find_elements(By.XPATH, row_xpath)) > 0)
+                break
+            except TimeoutException:
+                pass
 
         # 1. Получаем заголовки таблицы через JS (значительно быстрее)
         header_names = driver.execute_script("""
@@ -98,13 +114,11 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
             '' # Пустые заголовки
         ]
         
-        # Обрабатываем строки с перехватом возможных StaleElementReferenceException
-        max_retries = 3
         current_page_products = []
         
-        for attempt in range(max_retries):
+        while True:
             try:
-                # ИЗВЛЕКАЕМ ДАННЫЕ ЧЕРЕЗ JAVASCRIPT (Выполняется мгновенно в браузере, а не гоняет запросы через Selenium API)
+                # ИЗВЛЕКАЕМ ДАННЫЕ ЧЕРЕЗ JAVАСCRIPT (Выполняется мгновенно в браузере, а не гоняет запросы через Selenium API)
                 js_script = """
                 let data = [];
                 let rows = document.evaluate(arguments[0], document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null);
@@ -125,9 +139,8 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
                 """
                 raw_data = driver.execute_script(js_script, row_xpath)
                 
-                # Если таблица пуста, возможно страница просто очень долго грузится - дадим ей еще шанс
-                if not raw_data and attempt < max_retries - 1:
-                    print(f"    -> [Ожидание] Товары пока не появились на странице (Попытка {attempt+1}/{max_retries}). Ждем еще 2 сек...")
+                # Защита от пустой таблицы во время перерисовки
+                if not raw_data:
                     time.sleep(2)
                     continue
                 
@@ -148,18 +161,12 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
                             
                     current_page_products.append(product_data)
                 
-                # Если удалось обработать все строки (даже если их 0 в конце), выходим из цикла попыток
+                # Успешно собрали данные
                 break 
                 
             except Exception as err:
-                print(f"    -> [Попытка {attempt+1}/{max_retries}] Ошибка при сборе строк таблиц (возможно Stale Element). Пробуем еще раз...")
+                print(f"    -> Ошибка при сборе строк таблиц (DOM в процессе обновления). Пробуем еще раз...")
                 time.sleep(2)
-                if attempt == max_retries - 1:
-                    print("    -> Не удалось извлечь данные со страницы после всех попыток.")
-        
-        if not current_page_products:
-            print("    -> Товаров на странице не найдено. Убедились окончательно. Похоже, это конец категории (или нет результатов).")
-            return
         
         # Сохранение в файл
         file_path = os.path.join(save_path, f"{category_name}.json")
@@ -189,11 +196,16 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
             page_num += 1
             next_url = f"{base_category_url}/prl/results/{page_num}"
             
+            # Небольшая задержка перед переходом для имитации человека
+            time.sleep(random.uniform(0.5, 1.0))
+            
             current_time = datetime.now().strftime("%H:%M:%S")
             print(f"    -> [{current_time}] Переход на страницу {page_num} из {max_pages}: {next_url}")
             
             driver.get(next_url)
-            time.sleep(0.5)
+            time.sleep(random.uniform(0.5, 1.0))
+            
+            check_and_reload_if_403(driver)
             handle_cookie_banner(driver)
             
         except Exception as e:
@@ -210,9 +222,11 @@ def process_url(driver, url, current_path, category_name="Root"):
 
     current_time = datetime.now().strftime("%H:%M:%S")
     print(f"\n[>] [{current_time}] Переход: {url}")
-    driver.get(url)
     
-    time.sleep(0.5)
+    time.sleep(random.uniform(0.5, 1.0))
+    driver.get(url)
+
+    check_and_reload_if_403(driver)
     handle_cookie_banner(driver)
     
     print("    -> Ожидание отрисовки контента (до 60 сек)...")
@@ -304,8 +318,8 @@ def main():
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
 
-    #driver = uc.Chrome(options=options, version_main=147)
-    driver = uc.Chrome(options=options)
+    driver = uc.Chrome(options=options, version_main=147)
+    #driver = uc.Chrome(options=options)
     driver.maximize_window()
     
     base_folder = os.path.join(os.path.dirname(__file__), "farnell", "data")
