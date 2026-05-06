@@ -34,20 +34,29 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
         current_time = datetime.now().strftime("%H:%M:%S")
         print(f"    -> [{current_time}] Начало сбора данных со страницы {page_num}...")
         
-        # Изменяем количество отображаемых элементов на 50 перед началом сбора
-        try:
-            # Ищем селект по ID
-            select_elem = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located((By.ID, "bx-pagination-select-table-pagination"))
-            )
-            select = Select(select_elem)
+        # Изменяем количество отображаемых элементов на 50 перед началом сбора только на первой странице
+        if page_num == 1:
+            try:
+                # Ищем селект по ID
+                select_elem = WebDriverWait(driver, 5).until(
+                    EC.presence_of_element_located((By.ID, "bx-pagination-select-table-pagination"))
+                )
+                select = Select(select_elem)
+                
+                # Если сейчас выбрано не 50, переключаем
+                if select.first_selected_option.get_attribute("value") != "50":
+                    select.select_by_value("50")
+                    print("    -> Переключили отображение на 50 товаров на страницу")
+                    time.sleep(1.5) # Небольшая задержка для загрузки
+            except Exception as e:
+                pass
             
-            # Если сейчас выбрано не 50, переключаем
-            if select.first_selected_option.get_attribute("value") != "50":
-                select.select_by_value("50")
-                print("    -> Переключили отображение на 50 товаров на страницу")
-                time.sleep(2) # Небольшая задержка для загрузки
-        except Exception as e:
+        # Надежное ожидание появления именно строк с товарами, так как заголовки могут появиться раньше самих данных
+        try:
+            WebDriverWait(driver, 20).until(
+                lambda d: len(d.find_elements(By.XPATH, "//tbody/tr[contains(@class, 'ProductListerTablestyles__TableRow')]")) > 0
+            )
+        except Exception:
             pass
 
         # 1. Получаем заголовки таблицы, чтобы сопоставить их со значениями
@@ -66,10 +75,19 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
         ]
         
         # Обрабатываем строки с перехватом возможных StaleElementReferenceException
-        max_retries = 3
+        max_retries = 10
+        current_page_products = []
+        
         for attempt in range(max_retries):
             try:
                 rows = driver.find_elements(By.XPATH, "//tbody/tr[contains(@class, 'ProductListerTablestyles__TableRow')]")
+                
+                # Если таблица пуста, возможно страница просто очень долго грузится - дадим ей еще шанс
+                if not rows and attempt < max_retries - 1:
+                    print(f"    -> [Ожидание] Товары пока не появились на странице (Попытка {attempt+1}/{max_retries}). Ждем еще 5 сек...")
+                    time.sleep(5)
+                    continue
+                
                 current_page_products = []
                 
                 for row in rows:
@@ -98,44 +116,40 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
                             
                     current_page_products.append(product_data)
                 
-                # Если цикл for завершился без "stale" ошибок, добавляем в файл и прерываем попытки
-                file_path = os.path.join(save_path, f"{category_name}.json")
-                
-                if os.path.exists(file_path):
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        try:
-                            saved_products = json.load(f)
-                        except json.JSONDecodeError:
-                            saved_products = []
-                else:
-                    saved_products = []
-                
-                saved_products.extend(current_page_products)
-                
-                with open(file_path, 'w', encoding='utf-8') as f:
-                    json.dump(saved_products, f, ensure_ascii=False, indent=4)
-                    
-                print(f"    -> [Сохранение] Добавлено {len(current_page_products)} товаров (Всего: {len(saved_products)}) в файл")
+                # Если удалось обработать все строки (даже если их 0 в конце), выходим из цикла попыток
                 break 
                 
             except Exception as err:
                 print(f"    -> [Попытка {attempt+1}/{max_retries}] Ошибка при сборе строк таблиц (возможно Stale Element). Пробуем еще раз...")
-                time.sleep(1)
+                time.sleep(2)
                 if attempt == max_retries - 1:
                     print("    -> Не удалось извлечь данные со страницы после всех попыток.")
+        
+        if not current_page_products:
+            print("    -> Товаров на странице не найдено. Убедились окончательно. Похоже, это конец категории (или нет результатов).")
+            return
+        
+        # Сохранение в файл
+        file_path = os.path.join(save_path, f"{category_name}.json")
+        
+        if os.path.exists(file_path):
+            with open(file_path, 'r', encoding='utf-8') as f:
+                try:
+                    saved_products = json.load(f)
+                except json.JSONDecodeError:
+                    saved_products = []
+        else:
+            saved_products = []
+        
+        saved_products.extend(current_page_products)
+        
+        with open(file_path, 'w', encoding='utf-8') as f:
+            json.dump(saved_products, f, ensure_ascii=False, indent=4)
             
+        print(f"    -> [Сохранение] Добавлено {len(current_page_products)} товаров (Всего: {len(saved_products)}) в файл")
+        
         # 3. Пагинация через URL
         try:
-            # Проверяем, есть ли кнопка далее и активна ли она
-            next_btn = WebDriverWait(driver, 5).until(
-                EC.presence_of_element_located((By.XPATH, "//button[contains(@class, 'bx--pagination__button--forward')]"))
-            )
-            
-            # Проверяем, активна ли кнопка
-            if next_btn.get_attribute("disabled") is not None or "disabled" in next_btn.get_attribute("class") or next_btn.get_attribute("disabled") == "true":
-                print("    -> Достигнута последняя страница (кнопка отключена).")
-                break
-            
             page_num += 1
             next_url = f"{base_category_url}/prl/results/{page_num}"
             
@@ -143,14 +157,13 @@ def parse_table_page(driver, category_name, save_path, base_category_url):
             print(f"    -> [{current_time}] Переход на страницу {page_num}: {next_url}")
             
             driver.get(next_url)
-            time.sleep(2)
+            time.sleep(0.5)
             handle_cookie_banner(driver)
             
-        except TimeoutException:
-            print("    -> Кнопка 'Далее' не найдена вовремя. Скорее всего, конец категории.")
-            break
+            # Проверку на 404 или отсутствие элементов мы делаем в начале следующей итерации (если current_page_products пуст)
+            
         except Exception as e:
-            print(f"    -> Остановка пагинации (переход в конец). Причина: {e}")
+            print(f"    -> Ошибка при переходе на следующую страницу: {e}")
             break
 
 def process_url(driver, url, current_path, category_name="Root"):
@@ -165,8 +178,7 @@ def process_url(driver, url, current_path, category_name="Root"):
     print(f"\n[>] [{current_time}] Переход: {url}")
     driver.get(url)
     
-    # Дадим начальное время на подгрузку страницы
-    time.sleep(2)
+    time.sleep(0.5)
     handle_cookie_banner(driver)
     
     print("    -> Ожидание отрисовки контента (до 60 сек)...")
@@ -257,8 +269,7 @@ def main():
     options.add_argument('--no-sandbox')
     options.add_argument('--disable-dev-shm-usage')
 
-    # Явно указываем версию драйвера 147, так как ваш браузер версии 147
-    driver = uc.Chrome(options=options, version_main=147)
+    driver = uc.Chrome(options=options)
     driver.maximize_window()
     
     base_folder = os.path.join(os.path.dirname(__file__), "farnell", "data")
