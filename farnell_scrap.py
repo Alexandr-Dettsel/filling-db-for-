@@ -183,10 +183,16 @@ def parse_table_page(context, category_name, save_path, base_category_url):
     driver = context['driver']
     print(f"[*] Собираем данные из таблицы для: {category_name}")
 
-    # Нормализуем базовый URL сразу — убираем /prl/results если есть
+    # Если передали URL вида .../prl/results/N, стартуем с N.
+    # Если номера нет — по умолчанию с первой страницы.
+    start_page_match = re.search(r'/prl/results/(\d+)', base_category_url)
+    page_num = int(start_page_match.group(1)) if start_page_match else 1
+    if page_num < 1:
+        page_num = 1
+
+    # Нормализуем базовый URL — убираем /prl/results и всё после.
     base_category_url = re.split(r'/prl/results', base_category_url)[0].rstrip('/')
 
-    page_num = 1
     max_pages = 1
 
     file_path = os.path.join(save_path, f"{category_name}.json")
@@ -256,8 +262,8 @@ def parse_table_page(context, category_name, save_path, base_category_url):
                     handle_cookie_banner(driver)
                     time.sleep(1)
 
-        # На первой странице определяем общее количество страниц
-        if page_num == 1:
+        # Определяем общее количество страниц (работает даже при старте не с 1-й).
+        if max_pages == 1:
             try:
                 pagination_xpath = (
                     "//span[contains(@class, 'bx--pagination__text')]"
